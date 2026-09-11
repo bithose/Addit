@@ -467,7 +467,12 @@ struct NowPlayingView: View {
         guard let album = playerService.currentTrack?.album else { return nil }
         if album.isLocal {
             guard let path = album.resolvedLocalCoverPath else { return nil }
-            return UIImage(contentsOfFile: path)
+            // Not `UIImage(contentsOfFile:)`: this function is `async` but runs
+            // on the main actor, so that was a full-resolution decode of a
+            // camera-roll photo on the main thread, at every track change.
+            return await albumArtService.thumbnail(
+                atPath: path, pixelSize: AlbumArtService.displayPixels
+            )
         }
         let resolution = await albumArtService.resolveAlbumArt(for: album)
         albumArtService.applyResolution(resolution, to: album, modelContext: modelContext)

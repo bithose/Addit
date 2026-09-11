@@ -224,9 +224,17 @@ struct ImprintButtonStyle: ButtonStyle {
 /// when the last one disappears. A UI-lifecycle singleton rather than an
 /// injected service — it has no app state, it's a sensor tap.
 ///
-/// Publishes the gravity vector's screen-plane components, quantized (~1°)
+/// Publishes the gravity vector's screen-plane components, quantized (~2°)
 /// so subscribers only re-render on visible changes rather than at the raw
 /// 30 Hz update rate.
+///
+/// That quantum is a performance control, not a smoothing one. Every rim on
+/// screen redraws when it changes — a screen of album covers is a dozen of
+/// them, each drawing two or three `AngularGradient` strokes — so the question
+/// it answers is "how small a change is worth a full redraw of every piece of
+/// glass in the app." The specular lobe is broad and its stops are soft, so
+/// steps of a couple of degrees are invisible where steps of one degree cost
+/// twice as much.
 @Observable
 final class MotionShine {
     static let shared = MotionShine()
@@ -246,8 +254,8 @@ final class MotionShine {
         manager.deviceMotionUpdateInterval = 1.0 / 30.0
         manager.startDeviceMotionUpdates(to: .main) { [weak self] motion, _ in
             guard let self, let g = motion?.gravity else { return }
-            let qx = (g.x * 64).rounded() / 64
-            let qy = (g.y * 64).rounded() / 64
+            let qx = (g.x * 32).rounded() / 32
+            let qy = (g.y * 32).rounded() / 32
             if qx != gravityX { gravityX = qx }
             if qy != gravityY { gravityY = qy }
         }
@@ -288,6 +296,7 @@ struct GlassRim<S: InsettableShape>: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var subscribed = false
+    @State private var isOnScreen = false
     private let motion = MotionShine.shared
 
     var body: some View {
@@ -323,8 +332,14 @@ struct GlassRim<S: InsettableShape>: View {
             }
         }
         .allowsHitTesting(false)
-        .onAppear { syncMotion(to: true) }
-        .onDisappear { syncMotion(to: false) }
+        .onAppear { isOnScreen = true; syncMotion(to: true) }
+        .onDisappear { isOnScreen = false; syncMotion(to: false) }
+        // Freezing mid-life already stops the redraws — `shineAngle` returns
+        // before it reads the gravity it would otherwise depend on — but the
+        // sensor would keep running until every rim on screen was torn down and
+        // rebuilt. Toggling Low Power Mode while looking at the library is
+        // exactly that case.
+        .onChange(of: isFrozen) { _, _ in syncMotion(to: isOnScreen) }
     }
 
     /// Dark mode: a bright lobe under the light and a weaker one wrapping to
@@ -373,8 +388,21 @@ struct GlassRim<S: InsettableShape>: View {
     /// `atan2(-gx, -gy)` swings it toward whichever screen edge currently
     /// faces up in the world as the device tilts.
     private var shineAngle: Angle {
-        if reduceMotion { return .degrees(-90) }
+        if isFrozen { return .degrees(-90) }
         return .degrees(-90) + .radians(atan2(-motion.gravityX, -motion.gravityY))
+    }
+
+    /// Reduce Motion, or Low Power Mode.
+    ///
+    /// The second is here because of where this view *is*: on every cover in
+    /// the library, so a gyro update is a redraw of every visible rim, and the
+    /// library is the screen whose scrolling has the least room to spare. On a
+    /// device running at reduced clocks the moving highlight is the first thing
+    /// that should stop being worth its cost. The hairline stays either way —
+    /// it's what keeps a dark-edged cover off the background — so what's lost
+    /// is the travel, not the edge.
+    private var isFrozen: Bool {
+        reduceMotion || PowerState.shared.isLowPower
     }
 
     /// Hold a gyro subscription exactly while this rim is on screen. Routed
@@ -384,7 +412,7 @@ struct GlassRim<S: InsettableShape>: View {
     /// or release one twice, either of which desyncs that counter and stops
     /// the shine for every other rim on screen.
     private func syncMotion(to want: Bool) {
-        let want = want && !reduceMotion
+        let want = want && !isFrozen
         guard want != subscribed else { return }
         subscribed = want
         if want { motion.addConsumer() } else { motion.removeConsumer() }

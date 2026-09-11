@@ -187,18 +187,14 @@ extension AlbumDetailView {
         .buttonStyle(.plain)
     }
 
-    /// "Add disc marker" / "Add tracks" controls in the header column.
-    var editControlsRow: some View {
-        editControlsRowContent
-    }
-
     /// Every edit-mode presentation: rename popup, delete confirmation, error
     /// alert, file importer, cloud picker.
     ///
-    /// Applied to the whole screen, **not** to `editControlsRow`, where these
-    /// used to live. That row is inside `headerSection`, which is a row in a
-    /// `List` — so scrolling it off screen tears it down and takes any alert
-    /// attached to it with it, while the `@State` driving the alert stays set.
+    /// Applied to the whole screen, **not** to the header's own add control
+    /// (now `editAddMenu`), where these used to live. That control is inside
+    /// `headerSection`, which is a row in a `List` — so scrolling it off screen
+    /// tears it down and takes any alert attached to it with it, while the
+    /// `@State` driving the alert stays set.
     /// That desync is invisible until you hit it and then total: renaming your
     /// way down a long tracklist scrolls the header away, and from that point
     /// tapping a name sets `editRenameTarget` to a value that is already
@@ -274,34 +270,32 @@ extension AlbumDetailView {
             }
     }
 
-    /// Laid out on the edit rows' grid: the plus glyph is centered in the
-    /// same 24pt leading slot as the trash buttons, so the "Add disc
-    /// marker" text starts exactly where the song titles do. It keeps the
-    /// 56pt band that `playButtons` used to occupy on its own row; view mode
-    /// no longer has that band, since play and shuffle moved up onto the
-    /// title's line, so edit mode's tracklist now starts lower than view
-    /// mode's. These controls have no title line to ride along on.
-    private var editControlsRowContent: some View {
-        HStack(spacing: 12) {
-            if !editItems.isEmpty {
-                Button {
-                    addEditDiscMarker()
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "plus")
-                            .font(.uiSubheadline)
-                            .frame(width: 24)
-                        Text("Add disc marker")
-                            .font(.uiSubheadline)
-                    }
-                }
-                .disabled(editItems.filter(\.isDiscMarker).count >= 100)
-            }
-
-            Spacer()
-
+    /// Edit mode's counterpart to `playButton`, riding in the same slot on the
+    /// same line: one ⊕ holding everything you can add to the album.
+    ///
+    /// These actions used to be a labelled row of their own under the title,
+    /// keeping the 56pt band the transport occupied back when it
+    /// had a row to itself. Play and shuffle moved up onto the title's line
+    /// and this row didn't, so it became 61pt of header — 77pt with the
+    /// stack's spacing — that view mode had no counterpart for, and the
+    /// tracklist dropped by exactly that much on entering edit mode. Moving
+    /// it up here is what closes the gap: both headers now hold the same
+    /// three slots, and only what is drawn inside them changes.
+    ///
+    /// A `plus` inside `GlassRim`'s circle, worn exactly the way `play.fill`
+    /// wears it — the ring marks the primary action, and adding is what edit
+    /// mode is for. Plain SF Symbols inside the menu rather than the 3D
+    /// `MenuIcon` ornaments the ellipsis menu uses: the set has no disc-marker
+    /// model, and half a menu of ornaments beside half a menu of flat glyphs
+    /// reads worse than either on its own.
+    var editAddMenu: some View {
+        Group {
             if isUploadingTracks {
                 LoadingIndicator(size: .small)
+                    .frame(
+                        width: AlbumDetailView.playControlSize,
+                        height: AlbumDetailView.playControlSize
+                    )
             } else if album.canEdit {
                 Menu {
                     // A cloud album can only take files from its own drive, so
@@ -312,34 +306,47 @@ extension AlbumDetailView {
                         Button {
                             editDriveSource = albumProvider
                         } label: {
-                            Label("From \(cloudLabel)", systemImage: "cloud")
+                            Label("Add from \(cloudLabel)", systemImage: "cloud")
                         }
                     } else {
                         ForEach(editSourceProviders) { provider in
                             Button {
                                 editDriveSource = provider
                             } label: {
-                                Label("From \(provider.displayName)", systemImage: "cloud")
+                                Label("Add from \(provider.displayName)", systemImage: "cloud")
                             }
                         }
                     }
                     Button {
                         showEditDocumentPicker = true
                     } label: {
-                        Label("From iPhone", systemImage: "iphone")
+                        Label("Add from iPhone", systemImage: "iphone")
+                    }
+
+                    // Only once there is a running order to divide — a disc
+                    // marker above an empty album has nothing to mark.
+                    if !editItems.isEmpty {
+                        Divider()
+                        Button {
+                            addEditDiscMarker()
+                        } label: {
+                            Label("Add Disc Marker", systemImage: "opticaldisc")
+                        }
+                        .disabled(editItems.filter(\.isDiscMarker).count >= 100)
                     }
                 } label: {
-                    Label("Add tracks", systemImage: "plus.circle")
-                        .font(.uiSubheadline)
+                    Image(systemName: "plus")
+                        .font(.ui(20, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .frame(
+                            width: AlbumDetailView.playControlSize,
+                            height: AlbumDetailView.playControlSize
+                        )
+                        .overlay { GlassRim(shape: Circle()) }
+                        .contentShape(Circle())
                 }
             }
         }
-        // Edit rows' 8pt edge inset, so the 24pt slot sits on the
-        // trash-button grid.
-        .padding(.horizontal, 8)
-        .frame(height: AlbumDetailView.playControlSize)
-        .padding(.top, 4)
-        .padding(.bottom, 1)
     }
 
     private var deleteEditTrackMessage: String {
@@ -877,6 +884,12 @@ extension AlbumDetailView {
             try? jpegData.write(to: coverURL)
             album.localCoverPath = "LocalAlbums/\(albumId)/cover.jpg"
             albumImage = croppedImage
+            // A local cover is rewritten *in place*, so nothing about the album
+            // changes to tell the library its thumbnail is stale — same path,
+            // same (absent) cover file id. Drop the cached sizes and bump the
+            // refresh token, which is what `artworkTaskID` watches.
+            albumArtService.invalidateThumbnails(atPath: coverURL.path)
+            albumArtService.bumpRefreshToken(for: album.googleFolderId)
             try? modelContext.save()
             return
         }

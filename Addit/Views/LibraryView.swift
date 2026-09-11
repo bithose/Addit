@@ -50,9 +50,14 @@ struct LibraryView: View {
     @State private var isSearchExpanded = false
     @FocusState private var isSearchFocused: Bool
     /// Live content offset of whichever list or grid is on screen, feeding the
-    /// toolbar orb's spin. Not clamped or reset between the two layouts: the
-    /// orb has no home position, so a jump just spins it.
-    @State private var scrollOffset: CGFloat = 0
+    /// toolbar orb's spin and the brand mark's rock. Not clamped or reset
+    /// between the two layouts: neither ornament has a home position, so a jump
+    /// just turns it.
+    ///
+    /// A box **this view never reads** — see `ScrollOffsetBox`. The two
+    /// ornaments read it themselves, so a scroll frame invalidates them and not
+    /// the whole library.
+    @State private var scrollOffset = ScrollOffsetBox()
     @AppStorage("storageSource") private var storageSource: String = StorageSource.googleDrive.rawValue
     @State private var showLocalImporter = false
     @State private var isImportingLocal = false
@@ -313,6 +318,21 @@ struct LibraryView: View {
 
     private func gridLayout(for width: CGFloat) -> (columns: [GridItem], coverSize: CGFloat) {
         let gutter = Self.gridGutter
+        // A `GeometryReader` reports zero on the pass that builds it, and the
+        // grid is built fresh every time this branch is entered — which is what
+        // switching libraries does, since the switch passes through the empty
+        // branch while the new library's albums resolve.
+        //
+        // The arithmetic below has no answer for that width: it clamps a
+        // negative remainder to a 1pt cover. A 1pt cover asks the art service
+        // for a 64px thumbnail, and 64px is what the cell then draws at 151pt
+        // once the real width lands. Answer with the minimum instead, which
+        // buckets to the same thumbnail size as any real phone width, so
+        // nothing is laid out — or cached — from a width that isn't one.
+        guard width > 0 else {
+            let column = GridItem(.fixed(Self.minCoverSize), spacing: gutter)
+            return ([column, column], Self.minCoverSize)
+        }
         let count = max(2, Int((width - gutter) / (Self.minCoverSize + gutter)))
         let coverSize = max(1, (width - CGFloat(count + 1) * gutter) / CGFloat(count))
         let column = GridItem(.fixed(coverSize), spacing: gutter)
@@ -328,26 +348,52 @@ struct LibraryView: View {
         return AccountManager.storageIdentifier(for: email)
     }
 
-    private var sourceAlbums: [Album] {
-        if currentSource == .localStorage {
-            // Local Library: show all local albums regardless of account
-            return albums.filter { $0.storageSource == .localStorage }
-        } else {
-            // Cloud: show only albums of the active account's provider that
-            // belong to the active account
-            let accountId = activeAccountId
-            return albums.filter { $0.storageSource == currentSource && $0.accountId == accountId }
+    /// A test for "belongs to the library currently on screen".
+    ///
+    /// Returned as a closure rather than written as a method taking an album so
+    /// that `activeAccountId` — which walks the account list — is resolved once
+    /// per filtering pass instead of once per album. The single definition is
+    /// the point too: which albums a library contains is decided here and only
+    /// here.
+    ///
+    /// Local Library shows every local album regardless of account; a cloud
+    /// library shows only the active account's albums for that provider.
+    private func currentLibraryFilter() -> (Album) -> Bool {
+        let source = currentSource
+        let accountId = activeAccountId
+        return { album in
+            source == .localStorage
+                ? album.storageSource == .localStorage
+                : album.storageSource == source && album.accountId == accountId
         }
     }
 
+    private var sourceAlbums: [Album] {
+        albums.filter(currentLibraryFilter())
+    }
+
+    /// The library, narrowed by the search field.
+    ///
+    /// One pass rather than filtering `sourceAlbums`: every element of these
+    /// arrays is a SwiftData model, so each test is a backing-store read with
+    /// observation registration attached, and walking the store twice costs
+    /// twice. Cheap now that this runs on real changes instead of on every
+    /// scroll frame, but there was never a reason for it to be two passes.
     private var filteredAlbums: [Album] {
-        let source = sourceAlbums
-        if searchText.isEmpty { return source }
+        guard !searchText.isEmpty else { return sourceAlbums }
         let query = searchText.lowercased()
-        return source.filter {
-            $0.name.lowercased().contains(query) ||
-            ($0.artistName?.lowercased().contains(query) ?? false)
+        let inLibrary = currentLibraryFilter()
+        return albums.filter { album in
+            guard inLibrary(album) else { return false }
+            return album.name.lowercased().contains(query)
+                || (album.artistName?.lowercased().contains(query) ?? false)
         }
+    }
+
+    /// `sourceAlbums.isEmpty` without building the array — this is only ever
+    /// asked as a question, and the answer short-circuits on the first hit.
+    private var hasAlbumsInCurrentLibrary: Bool {
+        albums.contains(where: currentLibraryFilter())
     }
 
     // MARK: - Add button
@@ -509,7 +555,7 @@ struct LibraryView: View {
 
             if !searchText.isEmpty && filteredAlbums.isEmpty {
                 ContentUnavailableView.search(text: searchText)
-            } else if sourceAlbums.isEmpty {
+            } else if !hasAlbumsInCurrentLibrary {
                 ScrollView {
                     ContentUnavailableView(
                         "No Albums Yet",
@@ -596,7 +642,7 @@ struct LibraryView: View {
                     }
                 }
                 .listStyle(.plain)
-                .tracksScrollOffset(into: $scrollOffset)
+                .tracksScrollOffset(into: scrollOffset)
             } else {
                 GeometryReader { geo in
                     let layout = gridLayout(for: geo.size.width)
@@ -640,7 +686,7 @@ struct LibraryView: View {
                             .padding(.vertical, 16)
                         }
                     }
-                    .tracksScrollOffset(into: $scrollOffset)
+                    .tracksScrollOffset(into: scrollOffset)
                 }
             }
         }
@@ -694,7 +740,7 @@ struct LibraryView: View {
                         }
                     } label: {
                         HStack(spacing: 6) {
-                            StorageSourceLogo(source: currentSource, scrollOffset: scrollOffset)
+                            StorageSourceLogo(source: currentSource, offset: scrollOffset)
                             Image(systemName: "chevron.down")
                                 .font(.uiCaption.weight(.semibold))
                         }
@@ -802,7 +848,7 @@ struct LibraryView: View {
                     } label: {
                         // The orb *is* the account button — same menu, same
                         // placement, glass instead of the SF glyph.
-                        PlasmaOrb(scrollOffset: scrollOffset)
+                        PlasmaOrb(offset: scrollOffset)
                     }
                 }
             }
@@ -1466,15 +1512,43 @@ struct AlbumArtworkThumbnail: View {
     let album: Album
     var size: CGFloat = 148
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.displayScale) private var displayScale
     @Environment(AlbumArtService.self) private var albumArtService
     @Environment(ThemeService.self) private var themeService
     @State private var image: UIImage?
 
+    /// The cover is fetched at the size it is *drawn* at, not the size it was
+    /// stored at — see `AlbumArtService`'s thumbnail cache for what that fixes.
+    ///
+    /// Rounded up to a multiple of 64 so that the handful of places covers
+    /// appear (48pt rows, grid cells that vary with screen width) collapse onto
+    /// a few cache entries instead of one per device. Rounding *up* keeps the
+    /// thumbnail at or above its drawn size, so it's never being scaled up.
+    private var thumbnailPixels: Int {
+        let exact = size * displayScale
+        return max(64, Int((exact / 64).rounded(.up)) * 64)
+    }
+
+    /// What the cover is fetched *for*: the art it should be showing, and the
+    /// size it is being drawn at.
+    ///
+    /// The pixel size belongs in here, and leaving it out is a bug with a very
+    /// specific look. A cell laid out before its container's width is known
+    /// fetches a thumbnail for that provisional size and caches it; when the
+    /// real width arrives, `size` changes and `thumbnailPixels` with it, but
+    /// nothing re-asks — `onAppear` has already run and this id hasn't moved.
+    /// The cell is then stranded holding a thumbnail built for a size it is no
+    /// longer drawn at, and the only thing that has ever fixed it is scrolling
+    /// the cell out of the grid and back so it is rebuilt from scratch.
+    ///
+    /// Sizes bucket to multiples of 64 before they reach here, so this changes
+    /// when the cover genuinely needs re-sampling — a rotation, the list/grid
+    /// toggle, a first layout — and not for every point of width.
     private var artworkTaskID: String {
         let refreshMarker = albumArtService.lastUpdatedAlbumFolderId == album.googleFolderId
             ? albumArtService.artworkRefreshVersion
             : 0
-        return "\(album.coverArtTaskID)-\(refreshMarker)-\(album.localCoverPath ?? "")"
+        return "\(album.coverArtTaskID)-\(refreshMarker)-\(album.localCoverPath ?? "")-\(thumbnailPixels)"
     }
 
     var body: some View {
@@ -1507,30 +1581,59 @@ struct AlbumArtworkThumbnail: View {
             // borders separate from the background (Phosphor kit).
             .overlay(GlassRim(cornerRadius: 12))
             .onAppear {
+                // Memory only: a row scrolling back into view draws its cover
+                // on this frame. Anything that would touch the disk waits for
+                // the task below — the old version read and decoded a local
+                // cover file *here*, on the main thread, on the frame a row
+                // appeared, which is the frame least able to afford it.
+                guard image == nil else { return }
                 if album.isLocal {
-                    if image == nil, let coverPath = album.resolvedLocalCoverPath {
-                        image = UIImage(contentsOfFile: coverPath)
+                    if let coverPath = album.resolvedLocalCoverPath {
+                        image = albumArtService.cachedThumbnail(
+                            atPath: coverPath, pixelSize: thumbnailPixels
+                        )
                     }
-                } else {
-                    // Show cached image instantly — no async, no file I/O
-                    if image == nil, let coverFileId = album.coverFileId {
-                        image = albumArtService.cachedImage(for: coverFileId)
-                    }
+                } else if let coverFileId = album.coverFileId {
+                    image = albumArtService.cachedThumbnail(
+                        for: coverFileId, pixelSize: thumbnailPixels
+                    )
                 }
             }
             .task(id: artworkTaskID) {
                 if album.isLocal {
                     if let coverPath = album.resolvedLocalCoverPath {
-                        image = UIImage(contentsOfFile: coverPath)
+                        image = await albumArtService.thumbnail(
+                            atPath: coverPath, pixelSize: thumbnailPixels
+                        )
                     }
                     return
                 }
-                // Resolve fully (disk cache + network) in background
+
+                // Known cover: straight to the thumbnail, which downloads the
+                // original first if this device has never seen it. Nothing to
+                // persist in this case — `resolveAlbumArt` would take the same
+                // early exit, having decoded the full-size image to do it.
+                if let coverFileId = album.coverFileId {
+                    if let thumbnail = await albumArtService.thumbnail(
+                        for: coverFileId, pixelSize: thumbnailPixels
+                    ) {
+                        image = thumbnail
+                        return
+                    }
+                }
+
+                // No cover on record: this is the discovery path, and the only
+                // one that has anything to write back.
                 let resolution = await albumArtService.resolveAlbumArt(for: album)
-                if resolution.image != nil || image == nil {
+                albumArtService.applyResolution(resolution, to: album, modelContext: modelContext)
+                if let found = resolution.resolvedCoverItem?.id,
+                   let thumbnail = await albumArtService.thumbnail(
+                       for: found, pixelSize: thumbnailPixels
+                   ) {
+                    image = thumbnail
+                } else if resolution.image != nil || image == nil {
                     image = resolution.image
                 }
-                albumArtService.applyResolution(resolution, to: album, modelContext: modelContext)
             }
     }
 }

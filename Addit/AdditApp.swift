@@ -126,18 +126,130 @@ struct AccountContainerView: View {
     /// channel, so the key is the contract between them.
     @AppStorage(AppStorageKey.usesLocalOnly) private var usesLocalOnly = false
 
+    /// Set once the launch animation has run its full length. Deliberately
+    /// `@State` on this view rather than anything derived from a clock: the
+    /// window's state is built when the *process* starts and survives every
+    /// backgrounding, so this is false exactly on a cold launch and stays true
+    /// through every resume afterwards. Swiping the app away kills the process,
+    /// which is what makes the animation play again.
+    @State private var launchHoldElapsed = false
+
+    /// How far the launch has got through leaving.
+    @State private var launchPhase = LaunchPhase.field
+
+    /// The splash's exit, which is a small sequence rather than a cross-fade:
+    /// the field fades out to black, black holds for a beat, and then the two
+    /// screens slide sideways in tandem.
+    private enum LaunchPhase {
+        /// Ripple field running under the wordmark.
+        case field
+        /// Faded down to black. Everything is still in place, just invisible.
+        case blackout
+        /// Sliding off to the left as the library comes in from the right.
+        case parting
+        /// Splash gone from the hierarchy.
+        case finished
+    }
+
+    /// Whether the launch has anything left to wait for: the field has run its
+    /// full length *and* the session has resolved. A slow restore holds the
+    /// field open past its hold, which is what it's for.
+    private var canLeaveSplash: Bool {
+        launchHoldElapsed && !authService.isRestoringSession
+    }
+
+    /// Where each screen sits during the slide, in screen widths: the library
+    /// waits one full width off to the right and the splash leaves one full
+    /// width to the left, which between them is the push.
+    ///
+    /// Read into a local before the effect closure below, because that closure
+    /// is `Sendable` and can't reach main-actor state — a captured `CGFloat`
+    /// is what crosses.
+    private var contentPull: CGFloat {
+        launchPhase == .parting || launchPhase == .finished ? 0 : 1
+    }
+
+    private var splashPull: CGFloat {
+        launchPhase == .parting ? -1 : 0
+    }
+
     var body: some View {
+        ZStack {
+            // Built as soon as the session resolves, which is usually well
+            // before the splash is done with the screen — so the library is
+            // warm, and its first frame isn't being assembled during the slide.
+            // Creating the `ModelContainer` mid-animation is exactly the kind
+            // of work that turns a 0.11s slide into a stutter.
+            if !authService.isRestoringSession {
+                accountContent
+                    // Enters from the right, travelling one full width, exactly
+                    // as an album does when you push into it. `visualEffect`
+                    // rather than a plain `.offset` so the width comes from the
+                    // view's own geometry without a `GeometryReader` in the
+                    // hierarchy — one wrapped around this would hand
+                    // `ContentView` a safe-area-inset frame and break every
+                    // full-bleed background inside it.
+                    .visualEffect { [pull = contentPull] content, proxy in
+                        content.offset(x: proxy.size.width * pull)
+                    }
+            }
+
+            if launchPhase != .finished {
+                LoadingSplashView(isBlackedOut: launchPhase != .field)
+                    // And out to the left in tandem, the other half of the same
+                    // push: both screens move together, no parallax, which is
+                    // what `FlatSlideAnimator` does everywhere else in the app.
+                    .visualEffect { [pull = splashPull] content, proxy in
+                        content.offset(x: proxy.size.width * pull)
+                    }
+            }
+        }
+        .task {
+            // `try?` swallows cancellation and falls through to the
+            // assignment, which is the behaviour we want: if this ever is
+            // cancelled, the app must not be left stranded on the splash.
+            try? await Task.sleep(for: .seconds(LoadingSplashView.launchHold))
+            launchHoldElapsed = true
+        }
+        // Keyed on the flag rather than run once, because the wait it's
+        // watching for can finish in either order — the hold can outlast the
+        // session restore or the other way round.
+        .task(id: canLeaveSplash) {
+            guard canLeaveSplash, launchPhase == .field else { return }
+
+            withAnimation(.easeInOut(duration: LoadingSplashView.blackoutFade)) {
+                launchPhase = .blackout
+            }
+            try? await Task.sleep(for: .seconds(
+                LoadingSplashView.blackoutFade + LoadingSplashView.blackoutHold
+            ))
+
+            // The library's own push, borrowed whole: same duration, same
+            // curve, same full-width travel, so arriving at the library reads
+            // as the first move of the same gesture that later takes you into
+            // an album. Referenced rather than copied — two numbers that have
+            // to match are one number.
+            withAnimation(.easeOut(duration: FlatSlideAnimator.duration)) {
+                launchPhase = .parting
+            }
+            try? await Task.sleep(for: .seconds(FlatSlideAnimator.duration))
+
+            // Unanimated: the splash is already a full width off-screen, and
+            // this only stops the field's `TimelineView` from redrawing a
+            // screen nobody can see.
+            launchPhase = .finished
+        }
+        // Also here, not just on `ContentView`: the restoring-session splash
+        // above is drawn by *this* view, so without it the first frame of a
+        // cold launch renders in the system's scheme and then flips.
+        .preferredColorScheme(themeService.effectiveColorScheme)
+    }
+
+    /// Whatever the session says should be on screen once the splash is done.
+    @ViewBuilder
+    private var accountContent: some View {
         Group {
-            if authService.isRestoringSession {
-                // Wait for auth to resolve before creating any ModelContainer.
-                //
-                // This is the splash you actually see on launch — it renders
-                // before `ContentView` exists at all, so ContentView's copy
-                // only ever covers account switching. Both call the same view;
-                // they used to be two hand-maintained VStacks, and the one down
-                // there was the one that never showed.
-                LoadingSplashView()
-            } else if let email = authService.userEmail {
+            if let email = authService.userEmail {
                 ContentView()
                     .modelContainer(Self.sharedContainer)
                     .id(email)
@@ -168,10 +280,6 @@ struct AccountContainerView: View {
                     .modelContainer(Self.signedOutContainer)
             }
         }
-        // Also here, not just on `ContentView`: the restoring-session splash
-        // above is drawn by *this* view, so without it the first frame of a
-        // cold launch renders in the system's scheme and then flips.
-        .preferredColorScheme(themeService.effectiveColorScheme)
     }
 
     // MARK: - Shared Container (single store for all accounts)

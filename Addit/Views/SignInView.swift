@@ -58,59 +58,6 @@ struct SignInView: View {
         .accessibilityLabel(title)
     }
 
-    /// "ADDIT" as extruded chrome.
-    ///
-    /// Three things stacked, which is what separates chrome from a grey
-    /// gradient: an extrusion of offset dark copies giving the letters depth, a
-    /// face carrying the classic chrome ramp — bright sky at the top, a hard
-    /// dark horizon across the middle, ground light bouncing up underneath —
-    /// and a specular sliver over the top edge.
-    ///
-    /// The face is Hoefler Text Black: iOS ships no blackletter at all (Druk and
-    /// Bebas are on the device but private to system UI), and of what's actually
-    /// available a heavy gothic serif is nearest to a metal logo. A real black
-    /// metal face would have to be bundled like Geist and Departure Mono are.
-    private var chromeWordmark: some View {
-        let face = Font.custom("HoeflerText-Black", size: 52)
-        return ZStack {
-            // Extrusion. Drawn back-to-front so the nearest slab is brightest —
-            // a flat-coloured extrusion reads as a drop shadow, not as depth.
-            ForEach((1...6).reversed(), id: \.self) { depth in
-                Text("ADDIT")
-                    .font(face)
-                    .tracking(2)
-                    .foregroundStyle(
-                        Color(white: 0.10 + 0.035 * Double(6 - depth))
-                    )
-                    .offset(y: CGFloat(depth))
-            }
-
-            Text("ADDIT")
-                .font(face)
-                .tracking(2)
-                .foregroundStyle(
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color(red: 0.17, green: 0.18, blue: 0.20), location: 0.00),
-                            .init(color: Color(red: 0.95, green: 0.97, blue: 1.00), location: 0.30),
-                            .init(color: Color(red: 0.54, green: 0.57, blue: 0.61), location: 0.47),
-                            // The horizon: a hard, dark band is the single most
-                            // recognisable feature of chrome. Without it this is
-                            // just a silver gradient.
-                            .init(color: Color(red: 0.11, green: 0.13, blue: 0.16), location: 0.52),
-                            .init(color: Color(red: 0.81, green: 0.85, blue: 0.90), location: 0.72),
-                            .init(color: Color(red: 0.43, green: 0.46, blue: 0.50), location: 0.88),
-                            .init(color: Color(red: 0.91, green: 0.94, blue: 0.98), location: 1.00),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
-                .shadow(color: .black.opacity(0.45), radius: 6, y: 4)
-        }
-        .compositingGroup()
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             Spacer(minLength: 20)
@@ -118,7 +65,7 @@ struct SignInView: View {
             DiscoHouse(side: 150)
 
             VStack(spacing: 10) {
-                chromeWordmark
+                ChromeWordmark()
                 Text("The cloud music library")
                     .font(.uiSubheadline)
                     .foregroundStyle(.secondary)

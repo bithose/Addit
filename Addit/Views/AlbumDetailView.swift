@@ -34,6 +34,9 @@ struct AlbumDetailView: View {
     @State private var showAccessSheet = false
     @State private var navigateToChat = false
     @State var albumImage: UIImage?
+    /// The header's title and artist, shown in full on glass over the line they
+    /// were cut on. Any tap puts it away.
+    @State private var isTitleExpanded = false
     /// The cover's own colour, or `nil` for art with none to take.
     /// The cover-derived page colour is shelved.
     ///
@@ -397,19 +400,84 @@ struct AlbumDetailView: View {
             .shadow(color: .black.opacity(0.22), radius: 4, x: 0, y: 3)
     }
 
+    /// The cover's slot. Both variants are the same square (`coverBox` sees to
+    /// that), so this `ZStack` never changes size — the swap is a pure
+    /// cross-fade with no layout movement at all.
+    private var coverSlot: some View {
+        ZStack {
+            if isEditing {
+                editableAlbumCover
+            } else {
+                albumCover
+            }
+        }
+    }
+
+    /// Title and artist. Both variants are the same row with the same
+    /// control-group width beside the text, so this slot is the same height in
+    /// both modes and the swap moves nothing.
+    private var titleSlot: some View {
+        ZStack {
+            if isEditing {
+                editTitleRow
+            } else {
+                titleRow
+            }
+        }
+    }
+
+    /// The blurb. Present whenever *either* mode has something to draw, so an
+    /// album that has a description keeps one steady slot and cross-fades the
+    /// text inside it rather than removing one block and inserting another.
+    ///
+    /// An album with no description still gains a row on entering edit mode —
+    /// there has to be somewhere to tap to write the first one, and view mode
+    /// can't reserve blank space for a blurb that doesn't exist. That is the
+    /// one presence change left in the header.
+    @ViewBuilder
+    private var descriptionSlot: some View {
+        if isEditing || hasAlbumDescription {
+            ZStack {
+                if isEditing {
+                    editDescriptionRow
+                } else {
+                    descriptionBlock
+                }
+            }
+        }
+    }
+
+    /// Whether there's a blurb to draw — the same test `descriptionBlock`
+    /// makes, hoisted so `descriptionSlot` can decide whether the slot exists
+    /// at all without duplicating the trimming rule.
+    private var hasAlbumDescription: Bool {
+        guard let blurb = album.albumDescription?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !blurb.isEmpty
+    }
+
+    /// The header, as a fixed sequence of *slots* rather than two whole
+    /// alternative stacks.
+    ///
+    /// The distinction is the whole reason the swap looks the way it does.
+    /// Branching the entire stack — `if isEditing { cover; title; … } else
+    /// { cover; title; … }` — gives SwiftUI two sibling subtrees, and during
+    /// the animated flip both are alive *in the VStack's layout at once*, so
+    /// the incoming cover is laid out underneath the outgoing one and the
+    /// header briefly stands two covers tall. That is the "a new album cover
+    /// appears underneath and replaces the edit one" on Cancel; entering hides
+    /// it only because the menu that triggers it is dismissing over the top.
+    ///
+    /// Each slot below instead keeps one position in the stack and swaps its
+    /// contents inside a `ZStack`, so the two variants overlap and cross-fade
+    /// in place. Nothing is ever laid out below anything else.
     private var headerSection: some View {
         Section {
             VStack(spacing: 16) {
-                if isEditing {
-                    editableAlbumCover
-                    editTitleBlock
-                    editControlsRow
-                    editDescriptionRow
-                } else {
-                    albumCover
-                    titleRow
-                    descriptionBlock
-                }
+                coverSlot
+                titleSlot
+                descriptionSlot
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, Self.listSideMargin)
@@ -424,43 +492,147 @@ struct AlbumDetailView: View {
         }
     }
 
-    /// Title and artist, ranged left off the same edge as the track numbers.
+    /// Title and artist, centered in what `titleRow` leaves between the two
+    /// controls — which, the controls being the same size, is the middle of the
+    /// line.
     ///
-    /// The inset that does that lives on `titleRow`, which owns both edges of
-    /// this line — the tracklist's left edge here, its right edge under the
-    /// transport. The cover above stays centered: it's a fixed square and
-    /// centering is its own decision, not one this block inherits.
+    /// Nothing here decides that. The block takes the width it is given and
+    /// centers inside it; the symmetry is `titleRow`'s doing.
     private var titleBlock: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .center, spacing: 4) {
+            FadingClampedText(
+                text: album.name,
+                font: .uiTitle2.weight(.semibold),
+                lines: 2
+            )
+
+            FadingClampedText(
+                text: album.artistName ?? "Unknown Artist",
+                font: .uiSubheadline
+            )
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        // The whole block is one target, both lines: what the fade says is cut
+        // could be either of them, and it is one piece of writing either way.
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeOut(duration: 0.18)) { isTitleExpanded = true }
+        }
+        // Where the card comes up. Published rather than laid out in place
+        // because the card has to be free to overlap the cover above it and the
+        // tracklist below, and a header row is no place to grow from.
+        .anchorPreference(key: TitleBoundsKey.self, value: .bounds) { $0 }
+    }
+
+    /// The full title and artist, on glass, over the line they were cut on.
+    ///
+    /// Not a popover or a sheet: those come with their own placement, their own
+    /// chrome and their own dismissal, and the ask here is smaller than any of
+    /// them — the same words, in the same place, with nothing in the way. So it
+    /// is drawn where the header's own anchor says the text is, and the only
+    /// interaction it has is that the next tap anywhere puts it away.
+    ///
+    /// `ViewThatFits` gives it a shape rather than a width: a title that fits on
+    /// one line gets a pill drawn to it, and only one that doesn't opens out
+    /// into a wrapped card.
+    private var expandedTitleCard: some View {
+        let card = VStack(spacing: 6) {
             Text(album.name)
                 .font(.uiTitle2.weight(.semibold))
-                .multilineTextAlignment(.leading)
-                .lineLimit(2)
+                .multilineTextAlignment(.center)
 
             Text(album.artistName ?? "Unknown Artist")
                 .font(.uiSubheadline)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+
+        return ViewThatFits(in: .horizontal) {
+            card.fixedSize()
+            card
+        }
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        // Every tap belongs to the layer behind this one — including the taps
+        // that land on the card itself. There is nothing to press here.
+        .allowsHitTesting(false)
     }
 
-    /// Title and artist on the left, transport on the right, sharing one
-    /// vertical.
+    private func dismissExpandedTitle() {
+        guard isTitleExpanded else { return }
+        withAnimation(.easeOut(duration: 0.14)) { isTitleExpanded = false }
+    }
+
+    /// The card and the sheet of nothing that holds the screen still behind it.
+    @ViewBuilder
+    private func expandedTitleLayer(_ anchor: Anchor<CGRect>?) -> some View {
+        if isTitleExpanded, let anchor {
+            GeometryReader { proxy in
+                let rect = proxy[anchor]
+                ZStack {
+                    // Catches everything: the tap that dismisses, the drag
+                    // that also dismisses, and equally the button press that
+                    // would otherwise carry on underneath while the card sat
+                    // over the page.
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { dismissExpandedTitle() }
+                        // Reaching to scroll is the other way of saying "done
+                        // reading". Two points of travel rather than a real
+                        // threshold: this gesture owns the touch it dismisses
+                        // on, so the page can't scroll with it either way, and
+                        // the sooner the card is gone the sooner the *next*
+                        // swipe is an ordinary scroll.
+                        .gesture(
+                            DragGesture(minimumDistance: 2)
+                                .onChanged { _ in dismissExpandedTitle() }
+                        )
+
+                    expandedTitleCard
+                        // Centered on the line it replaces. Horizontally on the
+                        // screen rather than on the anchor: the two are within
+                        // a few points of each other — the title's box sits
+                        // between two equal controls — and the screen's centre
+                        // is the one that can't push a wide card off an edge.
+                        .frame(maxWidth: proxy.size.width - 2 * Self.listSideMargin)
+                        .position(x: proxy.size.width / 2, y: rect.midY)
+                }
+            }
+            .ignoresSafeArea()
+            .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .center)))
+        }
+    }
+
+    /// Shuffle, title and artist, play — one control at each end of the line
+    /// with the text centered between them.
     ///
     /// Play and shuffle used to sit on their own row underneath, which spent a
     /// full 56pt band of header on two glyphs while the space beside a
-    /// one-line title sat empty. Centering the pair against the text block
-    /// puts them on the line the eye is already reading and hands the
-    /// tracklist that band back.
+    /// one-line title sat empty. Bringing them onto the title's line put them
+    /// where the eye already is and handed the tracklist that band back.
+    ///
+    /// They sat *together* at the right at first, which left the text ranged
+    /// off to one side of a line whose other end was 68pt away — centering it
+    /// then took measuring that gap and shifting what was drawn into it.
+    /// Splitting the pair is the same correction made structurally: with a
+    /// control on each end the text's own box *is* the middle, so it centers by
+    /// sitting where it falls. Play keeps the right-hand corner — it is the
+    /// primary action and the thumb is already there — and shuffle takes the
+    /// left, where its 56pt target has the tracklist's own edge to sit on.
     ///
     /// Both insets are the tracklist's own: `rowLeadingInset` on the left, so
-    /// the title lands on the cover's tangent with the track numbers, and the
-    /// 8pt of `trackRowTrailingInset` on the right, so the play ring's edge
-    /// lands on the track rows' right edge.
+    /// the shuffle target starts on the cover's tangent with the track numbers,
+    /// and the 8pt of `trackRowTrailingInset` on the right, so the play ring's
+    /// edge lands on the track rows' right edge.
     private var titleRow: some View {
         HStack(alignment: .center, spacing: 12) {
+            shuffleButton
+                .frame(width: Self.playControlSize, alignment: .leading)
             titleBlock
-            playButtons
+            playButton
+                .frame(width: Self.playControlSize, alignment: .trailing)
         }
         .padding(.leading, Self.rowLeadingInset)
         .padding(.trailing, Self.trackRowTrailingInset - Self.listSideMargin)
@@ -497,68 +669,73 @@ struct AlbumDetailView: View {
         }
     }
 
-    /// Play and shuffle, as bare glyphs.
+    /// Shuffle, at the left end of the title's line.
     ///
-    /// They used to be `TactileButtonStyle` caps seated in debossed sockets,
-    /// matching the album cover's crater. That treatment is gone, so these are
-    /// the icons and nothing else — except a `GlassRim` around play, the same
-    /// tilt-tracking hairline the library covers wear, which marks it as the
-    /// primary action without putting a plate back under it. Unlike a cover,
-    /// this one sits on the page rather than on artwork, so in light mode the
-    /// rim's white lobe has much less to bite on and what travels around the
-    /// circle is mostly its shaded half. How much less now depends on the
-    /// album: the page carries the cover's colour, and a saturated one gives
-    /// the highlight more to work against than bare white ever did.
+    /// A bare glyph in a 56pt tap target, and no ring: the ring belongs to
+    /// `playButton` and marks the primary action. What the two share is the
+    /// target size, which is what makes the line symmetrical about the text
+    /// between them.
     ///
-    /// Play is the outer one, hard against the tracklist's right edge, with
-    /// shuffle inboard of it: the primary action gets the corner, where the
-    /// thumb already is. The 56pt frames are the tap targets, and their
-    /// spacing is tight because the frames are far wider than the glyphs —
-    /// 4pt here still leaves ~40pt of air between the two marks.
-    var playButtons: some View {
-        HStack(spacing: 4) {
-            Button {
-                if isThisAlbumPlaying {
-                    playerService.toggleShuffle()
-                } else {
-                    playerService.playAlbum(album, shuffled: true)
+    /// The 56pt frame is far wider than the 20pt glyph, so the mark sits
+    /// visually inboard of the tracklist's edge while the target itself starts
+    /// on it — the target is aligned, not the ink.
+    var shuffleButton: some View {
+        Button {
+            if isThisAlbumPlaying {
+                playerService.toggleShuffle()
+            } else {
+                playerService.playAlbum(album, shuffled: true)
+            }
+        } label: {
+            // On/off needs two signals, not one. Tinting the glyph alone
+            // failed because the accent is a pale cyan and the off state
+            // was `.primary` — two light colours a shade apart, which is
+            // no signal at all. Off is now dimmed, and on adds a dot.
+            Image(systemName: "shuffle")
+                .font(.ui(20, weight: .semibold))
+                .foregroundStyle(shuffleEngaged ? themeService.accentColor : .secondary)
+                .frame(width: Self.playControlSize, height: Self.playControlSize)
+                .overlay(alignment: .bottom) {
+                    // The running-state idiom: a dot under the thing that
+                    // is on. Sized and placed to sit clear of the glyph
+                    // without needing a plate to sit on.
+                    Circle()
+                        .fill(themeService.accentColor)
+                        .frame(width: 5, height: 5)
+                        .padding(.bottom, 11)
+                        .opacity(shuffleEngaged ? 1 : 0)
                 }
-            } label: {
-                // On/off needs two signals, not one. Tinting the glyph alone
-                // failed because the accent is a pale cyan and the off state
-                // was `.primary` — two light colours a shade apart, which is
-                // no signal at all. Off is now dimmed, and on adds a dot.
-                Image(systemName: "shuffle")
-                    .font(.ui(20, weight: .semibold))
-                    .foregroundStyle(shuffleEngaged ? themeService.accentColor : .secondary)
-                    .frame(width: Self.playControlSize, height: Self.playControlSize)
-                    .overlay(alignment: .bottom) {
-                        // The running-state idiom: a dot under the thing that
-                        // is on. Sized and placed to sit clear of the glyph
-                        // without needing a plate to sit on.
-                        Circle()
-                            .fill(themeService.accentColor)
-                            .frame(width: 5, height: 5)
-                            .padding(.bottom, 11)
-                            .opacity(shuffleEngaged ? 1 : 0)
-                    }
-                    .contentShape(Circle())
-            }
-            .buttonStyle(ImprintButtonStyle())
-            .animation(.easeInOut(duration: 0.18), value: shuffleEngaged)
-
-            Button {
-                playerService.playAlbum(album)
-            } label: {
-                Image(systemName: "play.fill")
-                    .font(.ui(20, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .frame(width: Self.playControlSize, height: Self.playControlSize)
-                    .overlay { GlassRim(shape: Circle()) }
-                    .contentShape(Circle())
-            }
-            .buttonStyle(ImprintButtonStyle())
+                .contentShape(Circle())
         }
+        .buttonStyle(ImprintButtonStyle())
+        .animation(.easeInOut(duration: 0.18), value: shuffleEngaged)
+    }
+
+    /// Play, at the right end, hard against the tracklist's edge.
+    ///
+    /// The bare glyph wears a `GlassRim` — the same tilt-tracking hairline the
+    /// library covers wear — which marks it as the primary action without
+    /// putting a plate back under it. These used to be `TactileButtonStyle`
+    /// caps seated in debossed sockets, matching the album cover's crater; that
+    /// treatment is gone, so this is the icon and its ring and nothing else.
+    ///
+    /// Unlike a cover, this ring sits on the page rather than on artwork, so in
+    /// light mode its white lobe has much less to bite on and what travels
+    /// around the circle is mostly the shaded half. How much less depends on
+    /// the album: the page carries the cover's colour, and a saturated one
+    /// gives the highlight more to work against than bare white ever did.
+    var playButton: some View {
+        Button {
+            playerService.playAlbum(album)
+        } label: {
+            Image(systemName: "play.fill")
+                .font(.ui(20, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: Self.playControlSize, height: Self.playControlSize)
+                .overlay { GlassRim(shape: Circle()) }
+                .contentShape(Circle())
+        }
+        .buttonStyle(ImprintButtonStyle())
     }
 
     /// The cover's top and bottom edges as fractions of the screen's height —
@@ -580,34 +757,66 @@ struct AlbumDetailView: View {
     static let playControlSize: CGFloat = 56
 
     /// Edit-mode title/artist: tap to open the rename popup, like the sheet.
-    /// Flat text — no engraving, no pencil — with the same fonts and line
-    /// limits as `titleBlock` so both header variants measure identically.
+    /// Flat text — no engraving, no pencil — with the same fonts, line limits
+    /// and centering as `titleBlock` so both header variants measure and sit
+    /// identically.
     private var editTitleBlock: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .center, spacing: 4) {
             Button {
                 beginEditRename(.title)
             } label: {
-                Text(editedTitle)
-                    // Same weight as `titleBlock`. `.bold()` was one step
-                    // heavier, so the title thickened on entering edit mode.
-                    .font(.uiTitle2.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
-                    .lineLimit(2)
+                // Same clamp and fade as `titleBlock`, so the two headers keep
+                // measuring identically. Tapping here opens the rename popup
+                // rather than the card — in edit mode the answer to "what does
+                // the rest of it say" is the field you're about to type in.
+                FadingClampedText(
+                    text: editedTitle,
+                    font: .uiTitle2.weight(.semibold),
+                    lines: 2
+                )
+                .foregroundStyle(.primary)
             }
             .buttonStyle(.plain)
 
             Button {
                 beginEditRename(.artist)
             } label: {
-                Text(editedArtist.isEmpty ? "Artist" : editedArtist)
-                    .font(.uiSubheadline)
-                    .foregroundStyle(editedArtist.isEmpty ? .tertiary : .secondary)
+                FadingClampedText(
+                    text: editedArtist.isEmpty ? "Artist" : editedArtist,
+                    font: .uiSubheadline
+                )
+                .foregroundStyle(editedArtist.isEmpty ? .tertiary : .secondary)
             }
             .buttonStyle(.plain)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, Self.rowLeadingInset)
+        // The same centering view mode's block gets, so entering edit mode
+        // still moves nothing on this line. Edit mode has no shuffle button to
+        // measure against, but it holds the identical slot — and matching the
+        // two matters more than matching a control that isn't there.
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    /// Edit mode's counterpart to `titleRow`, and deliberately the same shape:
+    /// two `playControlSize` slots with the text centered between them. Same
+    /// insets, same 12pt gaps, and the same height floor — which it gets the
+    /// way `titleRow` does, from the button sitting in it rather than from a
+    /// frame. The two rows therefore measure identically and entering edit mode
+    /// moves nothing on this line.
+    private var editTitleRow: some View {
+        HStack(alignment: .center, spacing: 12) {
+            // Edit mode has no shuffle, but it has to hold shuffle's place:
+            // the text between the two slots is centered by *being* the middle,
+            // so a missing left slot would slide the title sideways on entering
+            // edit mode. Clear, not a `Spacer` — a spacer would take the slack
+            // that keeps the text block centered.
+            Color.clear
+                .frame(width: Self.playControlSize)
+            editTitleBlock
+            editAddMenu
+                .frame(width: Self.playControlSize, alignment: .trailing)
+        }
+        .padding(.leading, Self.rowLeadingInset)
+        .padding(.trailing, Self.trackRowTrailingInset - Self.listSideMargin)
     }
 
     /// Edit-mode counterpart of `descriptionBlock`, under the row that stands
@@ -621,7 +830,11 @@ struct AlbumDetailView: View {
                 .font(.uiBody)
                 .foregroundStyle(editedDescription.isEmpty ? .tertiary : .secondary)
                 .multilineTextAlignment(.center)
-                .lineLimit(4)
+                // Follows the read-only block rather than always capping at 4.
+                // A blurb the user had expanded shows every line; capping here
+                // collapsed it on entering edit mode, which is a jump of
+                // however many lines they'd just opened.
+                .lineLimit(isDescriptionExpanded ? nil : 4)
                 .padding(.top, 3)
                 .padding(.horizontal, 32)
         }
@@ -1245,6 +1458,11 @@ struct AlbumDetailView: View {
         // Edit-mode presentations belong to the screen, not to the header row
         // they used to hang off — see `editModePresentations`.
         editModePresentations(chromeLayer)
+        // Above the page, so the card can sit over the cover and the tracklist
+        // both, and so the layer that holds the screen still covers all of it.
+        .overlayPreferenceValue(TitleBoundsKey.self) { anchor in
+            expandedTitleLayer(anchor)
+        }
         .sheet(isPresented: $showAccessSheet) {
             AccessSheet(album: album)
         }
@@ -1390,7 +1608,16 @@ struct AlbumDetailView: View {
             if albumImage == nil {
                 if album.isLocal {
                     if let coverPath = album.resolvedLocalCoverPath {
-                        albumImage = UIImage(contentsOfFile: coverPath)
+                        // Memory only, like the cloud branch below. This used
+                        // to read and decode the file right here — a
+                        // full-resolution photo decoded synchronously on the
+                        // frame the page slides in, which is the one frame in
+                        // the whole flow that has no slack. A miss now simply
+                        // waits for the task below and lands a frame or two
+                        // later, the way a cold cloud cover always has.
+                        albumImage = albumArtService.cachedThumbnail(
+                            atPath: coverPath, pixelSize: AlbumArtService.displayPixels
+                        )
                     }
                 } else if let coverFileId = album.coverFileId {
                     albumImage = albumArtService.cachedImage(for: coverFileId)
@@ -1427,7 +1654,9 @@ struct AlbumDetailView: View {
         .task(id: artworkTaskID) {
             if album.isLocal {
                 if let coverPath = album.resolvedLocalCoverPath {
-                    albumImage = UIImage(contentsOfFile: coverPath)
+                    albumImage = await albumArtService.thumbnail(
+                        atPath: coverPath, pixelSize: AlbumArtService.displayPixels
+                    )
                 }
             } else {
                 let resolution = await albumArtService.resolveAlbumArt(for: album)
@@ -1882,6 +2111,15 @@ struct AlbumDetailView: View {
         } catch {
             // Keep existing cover metadata on error
         }
+    }
+}
+
+/// Where the header's title and artist sit, so the card that shows them in full
+/// can come up over that same line.
+private struct TitleBoundsKey: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = value ?? nextValue()
     }
 }
 

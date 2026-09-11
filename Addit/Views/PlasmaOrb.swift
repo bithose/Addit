@@ -8,7 +8,11 @@ import SwiftUI
 /// where the reasoning about the two lives.
 struct PlasmaOrb: View {
     /// Content offset of whatever scroll view this is watching.
-    var scrollOffset: CGFloat
+    ///
+    /// A box rather than a `CGFloat` so that the read happens *here* — see
+    /// `ScrollOffsetBox`. Passing the number would make the screen that owns
+    /// the scroll view re-render on every frame of every scroll.
+    var offset: ScrollOffsetBox
     var diameter: CGFloat = 28
 
     /// Radians of spin per point scrolled. A full turn is a bit over two
@@ -20,10 +24,13 @@ struct PlasmaOrb: View {
     private static let maxTwist: Double = 1.25
 
     var body: some View {
-        ScrollTorque(scrollOffset: scrollOffset, maxTwist: Self.maxTwist) { twist in
+        // Read once per update, not twice: the box is observable, and two reads
+        // is two chances to catch different values inside one frame.
+        let scroll = offset.value
+        return ScrollTorque(scrollOffset: scroll, maxTwist: Self.maxTwist) { twist in
             PlasmaOrbGlass(
                 diameter: diameter,
-                angle: scrollOffset * Self.radiansPerPoint,
+                angle: scroll * Self.radiansPerPoint,
                 twist: twist
             )
         }
@@ -101,15 +108,17 @@ struct SpinningPlasmaOrb: View {
 }
 
 #Preview("Orb") {
-    @Previewable @State var offset: CGFloat = 0
+    @Previewable @State var box = ScrollOffsetBox()
 
     VStack(spacing: 32) {
-        PlasmaOrb(scrollOffset: offset, diameter: 160)
+        PlasmaOrb(offset: box, diameter: 160)
         HStack(spacing: 24) {
-            PlasmaOrb(scrollOffset: offset, diameter: 28)
-            PlasmaOrb(scrollOffset: offset + 40, diameter: 44)
+            PlasmaOrb(offset: box, diameter: 28)
+            PlasmaOrb(offset: box, diameter: 44)
         }
-        Slider(value: $offset, in: -600...600)
+        // The slider stands in for the scroll view: same box, driven by hand.
+        Slider(value: Binding(get: { box.value }, set: { box.value = $0 }),
+               in: -600...600)
     }
     .padding(40)
     .background(Color(red: 0.05, green: 0.05, blue: 0.06))

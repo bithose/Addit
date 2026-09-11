@@ -145,6 +145,32 @@ Signing check (device builds): append
   outlived the screen (unstructured `Task`s), but the ring used to exist only in
   the album's toolbar, so leaving made a running job look stopped. Export is
   deliberately still modal — it ends in a share sheet.
+- **Scroll-driven ornaments**: the library's toolbar orb and brand mark follow
+  the scroll through `ScrollOffsetBox` (`ScrollTorque.swift`), an `@Observable`
+  box, and **the screen that owns the box must never read `value`**. As a
+  `@State CGFloat` it made `LibraryView.body` — two filtering passes over every
+  album, each a SwiftData read — a dependency of the scroll, re-run every frame.
+  Reading it inside the ornaments puts that dependency where the value is used.
+  These two keep moving in Low Power Mode — settled; they're small, they're the
+  app's signature, and the box is what made them cheap. `GlassRim`'s gyro
+  highlight is the one that holds still there (`PowerState.shared.isLowPower`),
+  because it's on every cover on screen: it *doesn't read* the gravity in that
+  state, so it stops being invalidated rather than merely stopping moving.
+- **Covers are fetched at the size they're drawn**: `AlbumArtService` keeps a
+  second cache of `ImageIO` thumbnails (`thumbnail(for:pixelSize:)` /
+  `thumbnail(atPath:pixelSize:)`), built off the main thread straight out of the
+  file. Grid and list cells ask for their own drawn size; anything showing a
+  cover large asks for `AlbumArtService.displayPixels`. Never
+  `UIImage(contentsOfFile:)` on a view's `onAppear` — that's a full-resolution
+  decode on the frame a row appears. **The drawn size is part of the artwork
+  task's identity** (`AlbumArtworkThumbnail.artworkTaskID`): without it a cell
+  laid out before its width is known keeps the thumbnail it fetched for the
+  provisional size forever, and only scrolling it out of the grid and back ever
+  fixes it. Relatedly, `gridLayout(for:)` refuses a non-positive width rather
+  than clamping it to a 1pt cover — a `GeometryReader` reports zero on the pass
+  that builds it, which is every library switch. Local covers are rewritten *in place*, so
+  their cache identity carries the file's mtime and the edit path calls
+  `invalidateThumbnails(atPath:)` + `bumpRefreshToken`.
 - **Navigation**: `ContentView` is the auth gate → `LibraryView` in a
   `NavigationStack`. `NowPlayingBar` mini-player overlays; `NowPlayingView` is a
   sheet. Accent color is scheme-aware (bridged into `ThemeService.currentScheme`).

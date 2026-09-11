@@ -112,6 +112,28 @@ final class AudioPlayerService {
     /// and rebuild the gapless schedule due to a queue mutation.
     @ObservationIgnored private var gaplessLoadTask: Task<Void, Never>?
 
+    /// In-flight `loadAndPlay` — the *current* track's load, as opposed to
+    /// `gaplessLoadTask`'s next-track preload. Cancelled by the next transport
+    /// action, so only one load is ever allowed to reach the engine.
+    ///
+    /// Every transport entry point goes through `beginLoadAndPlay()`, never
+    /// `Task { await loadAndPlay() }` directly. Skips are the one thing a user
+    /// can issue faster than a load completes — a lock-screen next button on a
+    /// track still downloading — and an unserialised load is two tracks racing
+    /// to schedule themselves on the same node.
+    @ObservationIgnored private var loadTask: Task<Void, Never>?
+
+    /// Identifies the current `loadAndPlay`. Bumped **only** by
+    /// `beginLoadAndPlay`, so `token == loadToken` asks exactly one question:
+    /// "is this still the load anybody wants?"
+    ///
+    /// Deliberately not `scheduleGeneration`, which answers a different one —
+    /// "are the engine's queued completions still valid?" — and is bumped by
+    /// every pause, seek and interruption. Keying a load's staleness on it
+    /// meant a pause during a download abandoned the load outright, leaving
+    /// `currentIndex` naming a track whose audio was never anchored.
+    @ObservationIgnored private var loadToken: UInt64 = 0
+
     /// In-flight Task that's fetching the current track's album artwork
     /// for the lock-screen Now Playing display. Cancelled when the
     /// current track changes so that a slow artwork fetch for track N
@@ -210,7 +232,7 @@ final class AudioPlayerService {
         print("[Q] playAlbum \"\(album.name)\" shuffled=\(shuffled) start=\(startIndex.map(String.init) ?? "random") first=\"\(queue.first?.name ?? "nil")\" queueLen=\(queue.count)")
         #endif
 
-        Task { await loadAndPlay() }
+        beginLoadAndPlay()
     }
 
     func playTrack(_ track: Track, inQueue tracks: [Track]) {
@@ -227,7 +249,7 @@ final class AudioPlayerService {
         #if DEBUG
         print("[Q] playTrack picked track=\"\(track.name)\" newIndex=\(currentIndex) queueLen=\(queue.count) shuffled=\(isShuffleOn)")
         #endif
-        Task { await loadAndPlay() }
+        beginLoadAndPlay()
     }
 
     /// Returns whether audio is actually going now. Callers that can do
@@ -399,7 +421,7 @@ final class AudioPlayerService {
             #if DEBUG
             print("[Q] next() path=userQueue track=\"\(nextTrack.name)\" newIndex=\(currentIndex) remainingUserQueue=\(userQueue.count)")
             #endif
-            Task { await loadAndPlay() }
+            beginLoadAndPlay()
             return
         }
 
@@ -415,7 +437,7 @@ final class AudioPlayerService {
         let advTrack = (currentIndex >= 0 && currentIndex < queue.count) ? queue[currentIndex].name : "?"
         print("[Q] next() path=regular newIndex=\(currentIndex) track=\"\(advTrack)\"")
         #endif
-        Task { await loadAndPlay() }
+        beginLoadAndPlay()
     }
 
     func previous() {
@@ -435,7 +457,7 @@ final class AudioPlayerService {
             seek(to: 0)
             return
         }
-        Task { await loadAndPlay() }
+        beginLoadAndPlay()
     }
 
     func seek(to time: TimeInterval) {
@@ -608,9 +630,22 @@ final class AudioPlayerService {
     // MARK: - Gapless rescheduling
 
     /// What track *should* play next given the current state of
-    /// `userQueue`, `queue`, `currentIndex`, and `repeatMode`. Mirrors the
-    /// branching in `scheduleNextTrackGapless`. `nil` means "nothing —
-    /// playback ends after the current track."
+    /// `userQueue`, `queue`, `currentIndex`, and `repeatMode`. `nil` means
+    /// "nothing — playback ends after the current track."
+    ///
+    /// **The single definition of "next".** `scheduleNextTrackGapless` stages
+    /// whatever this returns and `rebuildGaplessIfNeeded` compares against it,
+    /// so the decision to preload a track and the decision that the preloaded
+    /// track is still the right one can't disagree. They used to be two
+    /// hand-kept copies of the same branch — the comparison read `queue.first`
+    /// where the scheduler read `queue[0]`, which is the same track and a
+    /// different behaviour on an empty queue (one is `nil`, the other traps).
+    ///
+    /// The user queue ALWAYS wins over the album's natural ordering — the
+    /// queue is the user's explicit "play this next" intent, and the album
+    /// track only fills in when the queue is empty. `idx` is where the track
+    /// will sit in `queue` once it is playing: for a queued track that's the
+    /// slot `handleTrackEnd` splices it into.
     private func desiredNextTrack() -> (track: Track, idx: Int, fromUserQueue: Bool)? {
         if !userQueue.isEmpty {
             return (userQueue[0], currentIndex + 1, true)
@@ -635,12 +670,60 @@ final class AudioPlayerService {
     private func rebuildGaplessIfNeeded() {
         let desired = desiredNextTrack()
         let desiredID = desired?.track.googleFileId
-        if desiredID == nextScheduledTrackID {
+        // Identity is not enough — **where the track came from** is half of
+        // what's staged. The same track can be the desired next both as the
+        // album's own following track and as the head of the user queue, and
+        // those stage differently: only the user-queue one makes
+        // `handleTrackEnd` splice the track into `queue` and pop `userQueue`.
+        //
+        // Comparing IDs alone therefore no-op'd exactly when it mattered.
+        // Queue the track that was already up next and this returned "still
+        // correct" against a schedule staged as an album track, so the
+        // boundary never consumed the queue entry: the track played, the
+        // entry stayed at the head of `userQueue`, and it played again as the
+        // queued track immediately afterwards.
+        let desiredFromUserQueue = desired?.fromUserQueue ?? false
+        if desiredID == nextScheduledTrackID, desiredFromUserQueue == nextIsFromUserQueue {
             #if DEBUG
-            print("[Q] rebuildGaplessIfNeeded NO-OP desired=\(desiredID ?? "nil") matches scheduled")
+            print("[Q] rebuildGaplessIfNeeded NO-OP desired=\(desiredID ?? "nil") fromUserQueue=\(desiredFromUserQueue) matches scheduled")
             #endif
             return
         }
+
+        // Same track, only its provenance changed — and it is already staged.
+        //
+        // Nothing about the *audio* is wrong here: the file held in memory
+        // (and, if armed, the segment sitting on the player node) is the same
+        // file either way, because it is the same track. All that is stale is
+        // the bookkeeping the boundary reads — whether `handleTrackEnd` should
+        // splice this track into `queue` and pop `userQueue`, and which slot
+        // it lands in. So correct those two fields in place and leave the
+        // engine entirely alone.
+        //
+        // Worth the special case because the general paths below are both
+        // wasteful here and one of them is audible: `replaceCurrentScheduling`
+        // would stop the node to re-arm the very segment already on it,
+        // costing the current track a buffer flush in its final half second
+        // to change nothing but a `Bool`. Re-preloading would re-decode a file
+        // already in memory.
+        //
+        // Staged is the right test rather than armed: once `nextAudioFile` and
+        // `nextTrackIndex` are set, the preload Task has left its staging
+        // block for the arm poll, so it can no longer overwrite what we write
+        // here from the values it captured. Before that point it still can,
+        // and the re-preload path below is free anyway.
+        if desiredID == nextScheduledTrackID,
+           let desired,
+           nextAudioFile != nil,
+           nextTrackIndex != nil {
+            #if DEBUG
+            print("[Q] rebuildGaplessIfNeeded RESTAMP track=\(desiredID ?? "nil") fromUserQueue=\(nextIsFromUserQueue)→\(desired.fromUserQueue) idx=\(nextTrackIndex.map(String.init) ?? "nil")→\(desired.idx) armed=\(isGaplessTransition) — engine untouched")
+            #endif
+            nextIsFromUserQueue = desired.fromUserQueue
+            nextTrackIndex = desired.idx
+            return
+        }
+
         if isGaplessTransition {
             // The next track has already been scheduled on the player
             // node. Removing a scheduled segment requires `stop()`, which
@@ -767,17 +850,59 @@ final class AudioPlayerService {
         }
     }
 
-    private func loadAndPlay() async {
-        guard let track = currentTrack else { return }
+    /// Start playing `queue[currentIndex]`, superseding any load already in
+    /// flight. **The only way to call `loadAndPlay`.**
+    ///
+    /// The two statements before the Task have to run *synchronously*, on the
+    /// caller's turn of the main actor, and that is the whole point of this
+    /// function existing. `loadAndPlay` is `async` and suspends on its first
+    /// download, so everything it does — including bumping the generation —
+    /// happens some time after the transport action that asked for it. Two
+    /// gaps open in that interval:
+    ///
+    /// - The outgoing track's scheduled completion is still valid, so a track
+    ///   that ends in the gap calls `handleTrackEnd`, which falls through to
+    ///   `next()` and advances a second time. Press next as a track is ending
+    ///   and you skip two.
+    /// - A second transport action starts a second `loadAndPlay` that
+    ///   interleaves with the first at its `await`s. Both then schedule a
+    ///   segment on the node, so the superseded track plays through *before*
+    ///   the one that was asked for, while `currentIndex` and the anchor name
+    ///   the latter. That is the wrong-track-plays / two-tracks-back-to-back
+    ///   failure, and it is likeliest exactly where it is least visible: a
+    ///   slow cloud download with the screen off.
+    ///
+    /// Bumping the generation closes the first gap and `isLoadingTrack` closes
+    /// it twice over (`completionFired` checks both). Cancelling `loadTask`
+    /// closes the second, together with the staleness guards inside the load.
+    private func beginLoadAndPlay() {
+        loadTask?.cancel()
+        scheduleGeneration &+= 1
+        loadToken &+= 1
+        isLoadingTrack = true
+        let token = loadToken
+        loadTask = Task { await loadAndPlay(token: token) }
+    }
+
+    private func loadAndPlay(token: UInt64) async {
+        guard let track = currentTrack else {
+            // `beginLoadAndPlay` set this on our behalf, and nothing else will
+            // clear it if we leave without having loaded anything — unless a
+            // newer load has started, in which case the flag is now its.
+            if token == loadToken { isLoadingTrack = false }
+            return
+        }
 
         isLoadingTrack = true
         isLoading = true
 
-        // Invalidate any pending completion from previous track
+        // Invalidate any pending completion from the previous track. This is
+        // the *outgoing* half of the bookkeeping; the segment this load will
+        // eventually schedule gets its own stamp further down, after the
+        // suspensions, because this one will be stale by then.
         scheduleGeneration &+= 1
-        let gen = scheduleGeneration
         #if DEBUG
-        print("[Q] loadAndPlay track=\"\(track.name)\" currentIndex=\(currentIndex) newGen=\(gen) userQueueLen=\(userQueue.count)")
+        print("[Q] loadAndPlay track=\"\(track.name)\" currentIndex=\(currentIndex) token=\(token) gen=\(scheduleGeneration) userQueueLen=\(userQueue.count)")
         #endif
 
         playerNode.stop()
@@ -795,6 +920,14 @@ final class AudioPlayerService {
                 fileURL = try await cacheService.cacheTrack(track)
             }
 
+            // A newer transport action has superseded this load. Bail before
+            // the first write: everything below here — the anchor, the graph
+            // reconnect, the scheduled segment — belongs to the live load now,
+            // and a stale one reaching the node is what queues two tracks.
+            // The flags belong to it too, so they are deliberately left alone.
+            try Task.checkCancellation()
+            guard token == loadToken else { return }
+
             var audioFile: AVAudioFile
             // Waveform extraction must read whatever AVAudioFile can — the
             // converted copy when the original format needed converting.
@@ -810,6 +943,26 @@ final class AudioPlayerService {
                 audioFile = try AVAudioFile(forReading: convertedURL)
                 waveformSourceURL = convertedURL
             }
+
+            // Checked again: a format conversion is the longest suspension in
+            // here by far, and the user is not going to wait through it.
+            try Task.checkCancellation()
+            guard token == loadToken else { return }
+
+            // Stamp the generation **here**, after every suspension, and use
+            // this value for the segment below.
+            //
+            // The stamp taken before the download describes a world that has
+            // since moved: a pause, a seek, a route change or an interruption
+            // each bump the generation while the bytes are still arriving. A
+            // segment scheduled with that stale stamp carries a completion
+            // handler whose `generation == scheduleGeneration` check can never
+            // pass again — so the track plays all the way through and then
+            // nothing advances. Silent stop at a track boundary, no error, and
+            // the likeliest way to reach it is a long cloud download with the
+            // screen off, which is where interruptions go unnoticed.
+            scheduleGeneration &+= 1
+            let gen = scheduleGeneration
 
             anchor = PlaybackAnchor(audioFile: audioFile, seekFrame: 0, playerTimeOffset: 0)
 
@@ -847,12 +1000,26 @@ final class AudioPlayerService {
             prefetchUpcoming()
             scheduleNextTrackGapless(afterGeneration: gen)
         } catch {
+            // A superseded load owns none of this state any more — the live
+            // one does — and must not report anything either, or every skip
+            // through a downloading track raises a failure alert for a track
+            // nobody is waiting on.
+            guard !Task.isCancelled, token == loadToken else { return }
+
             isLoading = false
             isLoadingTrack = false
+            // Without this the transport is left claiming to play a track that
+            // never started. `isPlaying` staying true is what leaves the lock
+            // screen extrapolating its playhead at rate 1.0 through silence —
+            // the "stopped at the end of track 4, lock screen showing halfway
+            // through track 5" failure, which is a load that threw at the
+            // boundary and said nothing.
+            isPlaying = false
             failedTrack = track
             playbackError = "Unable to play this audio format"
+            updateNowPlayingPlaybackInfo()
             #if DEBUG
-            print("Failed to load track: \(error.localizedDescription)")
+            print("[Q] loadAndPlay FAILED track=\"\(track.name)\" token=\(token) error=\(error)")
             #endif
         }
     }
@@ -1087,30 +1254,10 @@ final class AudioPlayerService {
         nextIsFromUserQueue = false
         nextScheduledTrackID = nil
 
-        // Pick the next track. User queue ALWAYS wins over the album's
-        // natural ordering — the queue is the user's explicit "play this
-        // next" intent. The album track only fills in when the queue is
-        // empty.
-        let nextTrack: Track
-        let nextIdx: Int
-        let fromUserQueue: Bool
-        if !userQueue.isEmpty {
-            nextTrack = userQueue[0]
-            // The queued track will be spliced into `queue` at this index
-            // when handleTrackEnd's gapless branch advances. We schedule it
-            // here so the engine has the audio ready well before the
-            // boundary.
-            nextIdx = currentIndex + 1
-            fromUserQueue = true
-        } else if currentIndex < queue.count - 1 {
-            nextTrack = queue[currentIndex + 1]
-            nextIdx = currentIndex + 1
-            fromUserQueue = false
-        } else if repeatMode == .all {
-            nextTrack = queue[0]
-            nextIdx = 0
-            fromUserQueue = false
-        } else {
+        // Pick the next track from the one definition of "next", so that what
+        // gets staged here and what `rebuildGaplessIfNeeded` later checks the
+        // staging against can never be two different opinions.
+        guard let (nextTrack, nextIdx, fromUserQueue) = desiredNextTrack() else {
             #if DEBUG
             print("[Q] scheduleNextTrackGapless BAIL reason=endOfQueue currentIndex=\(currentIndex) queueLen=\(queue.count) repeat=\(repeatMode) scheduleGen=\(gen)")
             #endif
@@ -1123,11 +1270,18 @@ final class AudioPlayerService {
 
         gaplessLoadTask?.cancel()
         let trackID = nextTrack.googleFileId
-        // Stake out the track ID immediately so rebuildGaplessIfNeeded's
+        // Stake out what we're loading immediately so rebuildGaplessIfNeeded's
         // comparison check sees it before the load completes — otherwise
         // a queue mutation that arrives mid-load would needlessly cancel
         // and restart against an identical desired target.
+        //
+        // Provenance is staked here with the ID rather than at staging time
+        // below, because it is half of that comparison. Setting it early is
+        // safe: the only reader is `handleTrackEnd`'s gapless branch, which
+        // runs solely when `isGaplessTransition` is set, and nothing is armed
+        // until the load has staged an audio file.
         nextScheduledTrackID = trackID
+        nextIsFromUserQueue = fromUserQueue
         gaplessLoadTask = Task {
             do {
                 let fileURL: URL
@@ -1178,7 +1332,17 @@ final class AudioPlayerService {
                 if let cached = nextTrack.cachedWaveform(expectedCount: nextBarCount) {
                     precomputedWaveform = cached
                 } else {
-                    precomputedWaveform = Self.extractWaveform(from: waveformSourceURL, barCount: nextBarCount)
+                    // Off the main actor, exactly as `generateWaveform` does
+                    // it. This whole Task is main-actor isolated, so calling
+                    // the `nonisolated` extractor directly ran a full read of
+                    // the next track's audio file on the main thread — while
+                    // the current track was playing. Anything that stalls the
+                    // main actor here stalls `completionFired`'s hop onto it,
+                    // and that hop is the track boundary.
+                    let source = waveformSourceURL
+                    precomputedWaveform = await Task.detached(priority: .utility) {
+                        Self.extractWaveform(from: source, barCount: nextBarCount)
+                    }.value
                     if let extracted = precomputedWaveform {
                         await MainActor.run {
                             nextTrack.storeWaveform(extracted)
@@ -1200,7 +1364,7 @@ final class AudioPlayerService {
                 nextFileURL = fileURL
                 nextWaveform = precomputedWaveform
                 nextWaveformSamplesPerSecond = nextSps
-                nextIsFromUserQueue = fromUserQueue
+                // `nextIsFromUserQueue` was staked out with the track ID above.
                 // isGaplessTransition stays false until armed.
                 #if DEBUG
                 print("[Q] preload LOADED track=\"\(nextTrack.name)\" fromUserQueue=\(fromUserQueue) — staged, not armed")
@@ -1233,8 +1397,15 @@ final class AudioPlayerService {
                     try? await Task.sleep(nanoseconds: UInt64(sleepSeconds * 1_000_000_000))
                 }
             } catch {
-                // Pre-loading failed (cancellation or load error) —
-                // normal non-gapless transition will happen via handleTrackEnd.
+                // Pre-loading failed — the normal non-gapless transition will
+                // happen via handleTrackEnd, which reaches for the track at the
+                // boundary instead. Logged because a swallowed reason here is
+                // exactly what makes a stalled boundary unreadable after the
+                // fact: this is the one line that distinguishes "the user
+                // skipped" from "the download never arrived".
+                #if DEBUG
+                print("[Q] preload FAILED track=\"\(nextTrack.name)\" gen=\(gen) error=\(error)")
+                #endif
             }
         }
     }
@@ -1762,12 +1933,42 @@ final class AudioPlayerService {
         artworkTask?.cancel()
         artworkTask = nil
 
-        if let album = currentTrack?.album, album.isLocal {
-            if let path = album.resolvedLocalCoverPath, let image = UIImage(contentsOfFile: path) {
-                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                var updatedInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                updatedInfo[MPMediaItemPropertyArtwork] = artwork
-                MPNowPlayingInfoCenter.default().nowPlayingInfo = updatedInfo
+        if let album = currentTrack?.album, album.isLocal, let albumArtService,
+           let path = album.resolvedLocalCoverPath {
+            // Through the same task, cancellation and staleness check as the
+            // cloud branch below — the local one used to be a *synchronous*
+            // `UIImage(contentsOfFile:)` right here, which decoded a full
+            // camera-roll photo on the main thread on every track change, with
+            // the audio engine's own work already on that thread. The path
+            // stands in for `coverFileId` as the identity to verify against,
+            // since a local album has no file id.
+            let expectedPath = path
+            #if DEBUG
+            print("[NP] artworkTask START localPath=\(path)")
+            #endif
+            artworkTask = Task {
+                do {
+                    let image = await albumArtService.thumbnail(
+                        atPath: path, pixelSize: AlbumArtService.displayPixels
+                    )
+                    try Task.checkCancellation()
+                    guard let image else { return }
+                    guard currentTrack?.album?.resolvedLocalCoverPath == expectedPath else {
+                        #if DEBUG
+                        print("[NP] artworkTask STALE expected=\(expectedPath) — dropping")
+                        #endif
+                        return
+                    }
+                    let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                    var updatedInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+                    updatedInfo[MPMediaItemPropertyArtwork] = artwork
+                    MPNowPlayingInfoCenter.default().nowPlayingInfo = updatedInfo
+                    #if DEBUG
+                    print("[NP] artworkTask APPLIED localPath=\(expectedPath)")
+                    #endif
+                } catch {
+                    // Cancellation — drop quietly.
+                }
             }
         } else if let coverFileId = currentTrack?.album?.coverFileId, let albumArtService {
             // Snapshot the expected coverFileId at launch time. When the

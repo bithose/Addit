@@ -9,9 +9,11 @@ import SwiftUI
 /// that it has a back, and no further.
 struct StorageSourceLogo: View {
     let source: StorageSource
-    /// Content offset of the library's list or grid. Left at zero the mark
-    /// simply sits face-on, which is what any non-scrolling caller wants.
-    var scrollOffset: CGFloat = 0
+    /// Content offset of the library's list or grid, in a box so that reading
+    /// it doesn't re-render the library — see `ScrollOffsetBox`. Left at its
+    /// default the mark simply sits face-on, which is what any non-scrolling
+    /// caller wants.
+    var offset = ScrollOffsetBox()
     /// Multiplies both the canvas and the footprint. A plain `scaleEffect`
     /// would blow up the rendered pixels; this re-marches at the larger size,
     /// so a big mark is actually sharp.
@@ -36,9 +38,11 @@ struct StorageSourceLogo: View {
     private static let maxTwist: Double = 0.55
 
     var body: some View {
-        let phase = Double(scrollOffset) * Self.radiansPerPoint
+        // Read once per update — see the note in `PlasmaOrb`.
+        let scroll = offset.value
+        let phase = Double(scroll) * Self.radiansPerPoint
 
-        ScrollTorque(scrollOffset: scrollOffset, maxTwist: Self.maxTwist) { twist in
+        return ScrollTorque(scrollOffset: scroll, maxTwist: Self.maxTwist) { twist in
             Rectangle()
                 .fill(.white)
                 .frame(width: canvas, height: canvas)
@@ -102,18 +106,18 @@ struct StorageSourceLogo: View {
 }
 
 #Preview("Marks") {
-    @Previewable @State var offset: CGFloat = 0
+    @Previewable @State var box = ScrollOffsetBox()
 
     VStack(spacing: 36) {
         HStack(spacing: 28) {
             ForEach([StorageSource.googleDrive, .oneDrive, .localStorage], id: \.self) { source in
-                StorageSourceLogo(source: source, scrollOffset: offset, scale: 5)
+                StorageSourceLogo(source: source, offset: box, scale: 5)
             }
         }
         HStack(spacing: 14) {
             ForEach([StorageSource.googleDrive, .oneDrive, .localStorage], id: \.self) { source in
                 HStack(spacing: 6) {
-                    StorageSourceLogo(source: source, scrollOffset: offset)
+                    StorageSourceLogo(source: source, offset: box)
                     Image(systemName: "chevron.down")
                         .font(.caption.weight(.semibold))
                 }
@@ -122,7 +126,9 @@ struct StorageSourceLogo: View {
                 .glassEffect(.regular, in: .capsule)
             }
         }
-        Slider(value: $offset, in: -600...600)
+        // The slider stands in for the scroll view: same box, driven by hand.
+        Slider(value: Binding(get: { box.value }, set: { box.value = $0 }),
+               in: -600...600)
     }
     .padding(40)
     .background(Color(red: 0.06, green: 0.06, blue: 0.07))

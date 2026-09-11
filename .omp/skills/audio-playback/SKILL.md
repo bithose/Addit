@@ -68,10 +68,72 @@ splices `userQueue.removeFirst()` into `queue` at `nextIndex` before advancing
 is checked then cleared in the same branch. The UI's `currentTrack` and queue
 display depend on this exact splice — change it and both break.
 
+## Two counters, two questions (do not conflate)
+
+- **`scheduleGeneration`** — "are the engine's queued completions still
+  valid?" Bumped by everything that touches the node: pause, seek,
+  interruption, route change, `replaceCurrentScheduling`, `forget`.
+- **`loadToken`** — "is this still the load anybody wants?" Bumped **only** by
+  `beginLoadAndPlay`.
+
+A load's staleness must be keyed on `loadToken`. Keying it on
+`scheduleGeneration` means a pause *during a download* abandons the load, and
+`currentIndex` is then left naming a track whose audio was never anchored.
+
+Corollary that cost a silent stop: **stamp the generation for a segment
+*after* the suspensions that precede scheduling it, not before.** `loadAndPlay`
+used to capture `gen` at the top and hand it to the completion handler it
+registered after the download. Any bump in between — one interruption, one
+route change — orphaned that completion permanently, so the track played to its
+end and nothing advanced. No error, no log; just silence at a boundary.
+
+## `beginLoadAndPlay` is the only way in
+
+Every transport entry point (`playAlbum`, `playTrack`, `next`, `previous`) calls
+`beginLoadAndPlay()`. **Never `Task { await loadAndPlay() }` directly.** The
+three statements it runs *synchronously*, before the Task body, are the point:
+
+- `loadTask?.cancel()` — one load at a time. Two concurrent loads each schedule
+  a segment, so the superseded track plays through *before* the requested one
+  while `currentIndex` names the latter.
+- `scheduleGeneration &+= 1` and `isLoadingTrack = true` — the outgoing track's
+  completion is still armed until these run. A track that ends in the gap calls
+  `handleTrackEnd` → `next()` and advances a second time (press next as a track
+  ends, skip two).
+
+Inside the load, bail on `token != loadToken` **without touching `isLoading` /
+`isLoadingTrack`** — the live load owns them. Same in the `catch`, or every skip
+through a downloading track raises a failure alert.
+
+## `desiredNextTrack()` is the single definition of "next"
+
+`scheduleNextTrackGapless` stages what it returns; `rebuildGaplessIfNeeded`
+compares against it. They were once two hand-kept copies of the same branch and
+had already drifted (`queue.first` vs `queue[0]` — same track, different
+behaviour on an empty queue).
+
+The comparison is on **`(trackID, fromUserQueue)`**, not the ID alone.
+Provenance is half the staged identity: the same track can be next both as the
+album's following track and as the head of `userQueue`, and only the latter
+makes `handleTrackEnd` splice it in and pop the queue. ID-only comparison
+no-op'd exactly there — queue the track already up next and it played twice,
+with the queue entry never consumed. `nextIsFromUserQueue` is therefore staked
+out beside `nextScheduledTrackID` when the load *starts*, not when it stages.
+
+A provenance-only change on an already-staged track takes neither rebuild path.
+The audio is the same file either way, so `rebuildGaplessIfNeeded` re-stamps
+`nextIsFromUserQueue` / `nextTrackIndex` in place and returns — **engine
+untouched**. Falling through to `replaceCurrentScheduling` would stop the node
+to re-arm the segment already on it, costing the current track a buffer flush
+in its last half second to change nothing but a `Bool`. The test is *staged*
+(`nextAudioFile` and `nextTrackIndex` both set), not *armed*: past that point
+the preload Task has left its staging block for the arm poll and can no longer
+clobber these from the values it captured.
+
 ## Cancellable async `Task` pattern (mandatory for new async work)
 
-Three `@ObservationIgnored private var task: Task<Void, Never>?` fields —
-`gaplessLoadTask`, `artworkTask`, `prefetchTask` — follow: `task?.cancel()`
+Four `@ObservationIgnored private var task: Task<Void, Never>?` fields —
+`loadTask`, `gaplessLoadTask`, `artworkTask`, `prefetchTask` — follow: `task?.cancel()`
 before kicking off a new one, `try Task.checkCancellation()` after each `await`,
 and compare-at-write checks before mutating state. This stops stale Tasks from
 clobbering current state after the user moves on. Any new async work in this

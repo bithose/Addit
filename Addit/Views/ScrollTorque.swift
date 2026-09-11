@@ -92,18 +92,42 @@ struct ScrollTorque<Content: View>: View {
     }
 }
 
+/// A scroll view's content offset, in a box so that watching it doesn't mean
+/// re-rendering the screen it belongs to.
+///
+/// **This being a reference type is the whole point of it.** The offset changes
+/// on every frame of every scroll, and a `@State CGFloat` on the screen that
+/// owns the scroll view makes that screen's `body` a dependency of it: the
+/// library was re-evaluating its entire body — including two filtering passes
+/// over every album in the store, each one reading SwiftData properties — sixty
+/// to a hundred and twenty times a second, to turn two 25pt ornaments in the
+/// toolbar. Handing the ornaments an `@Observable` box instead means the
+/// dependency is registered where the value is actually read, so a scroll frame
+/// invalidates the ornaments and nothing else.
+///
+/// The rule that follows: **the view that owns the box must never read
+/// `value`.** One `box.value` in a screen's `body` puts the whole cost back.
+@Observable
+final class ScrollOffsetBox {
+    var value: CGFloat = 0
+
+    init(_ value: CGFloat = 0) {
+        self.value = value
+    }
+}
+
 extension View {
-    /// Publish this scroll container's vertical content offset into `offset`.
+    /// Publish this scroll container's vertical content offset into `box`.
     ///
     /// `onScrollGeometryChange` rather than a `GeometryReader` in the content:
     /// the reader only reports rows it is inside of, so it stops updating once
     /// its row is recycled out of a lazy grid, and it reports during layout
     /// rather than as the scroll moves.
-    func tracksScrollOffset(into offset: Binding<CGFloat>) -> some View {
+    func tracksScrollOffset(into box: ScrollOffsetBox) -> some View {
         onScrollGeometryChange(for: CGFloat.self) { geometry in
             geometry.contentOffset.y
         } action: { _, new in
-            offset.wrappedValue = new
+            box.value = new
         }
     }
 }
