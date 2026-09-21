@@ -34,9 +34,6 @@ struct AlbumDetailView: View {
     @State private var showAccessSheet = false
     @State private var navigateToChat = false
     @State var albumImage: UIImage?
-    /// The header's title and artist, shown in full on glass over the line they
-    /// were cut on. Any tap puts it away.
-    @State private var isTitleExpanded = false
     /// The cover's own colour, or `nil` for art with none to take.
     /// The cover-derived page colour is shelved.
     ///
@@ -96,6 +93,8 @@ struct AlbumDetailView: View {
     /// True only while a pull has actually triggered a sync. Gates the
     /// pull-to-refresh indicator.
     @State private var isRefreshing = false
+    /// Whether the tap-toggled tracklist overlay is up over the artwork.
+    @State private var showOverlay = false
 
     // MARK: Inline edit mode state (behavior inherited from the old AlbumMetadataEditorSheet)
 
@@ -229,6 +228,12 @@ struct AlbumDetailView: View {
     /// on screen — the size the cover was fixed at for most of its life.
     private static let fallbackCoverSize: CGFloat = 256
 
+    /// Side inset of the bottom bar, matched to the pill's `horizontalInset`.
+    private static let barHorizontalInset: CGFloat = 12
+
+    /// Corner radius of the bottom bar's glass panel, matched to the pill's.
+    private static let barCornerRadius: CGFloat = 20
+
 
     var sortedTracks: [Track] {
         album.tracks.sorted { $0.trackNumber < $1.trackNumber }
@@ -308,8 +313,8 @@ struct AlbumDetailView: View {
     /// rule that remains is a one-liner: decorate inside the closure, never
     /// on the value this returns.
     ///
-    /// `content` receives the side length because `PixelSortCoverView` needs
-    /// a concrete number to build its pixel grid from.
+    /// `content` receives the side length because the edit-mode cover draws
+    /// against a concrete square.
     private func coverBox<Content: View>(
         @ViewBuilder content: @escaping (CGFloat) -> Content
     ) -> some View {
@@ -347,70 +352,16 @@ struct AlbumDetailView: View {
         )
     }
 
-    /// The tappable artwork itself (pixel-sort interaction preserved),
-    /// clipped to its rounded rect. No shadows here — the mount adds those.
-    private var coverArtwork: some View {
-        coverBox { side in
-            RoundedRectangle(cornerRadius: coverCorner, style: .continuous)
-                .fill(coverPlaceholderFill)
-                .overlay {
-                    if let albumImage {
-                        // Tap to kick off a luminance-based pixel-sort
-                        // animation; tap again at the sorted state to replay
-                        // the log in reverse back to the original.
-                        PixelSortCoverView(
-                            image: albumImage,
-                            size: side,
-                            cornerRadius: coverCorner
-                        )
-                    } else {
-                        Image(systemName: "music.note")
-                            .font(.ui(48))
-                            .foregroundStyle(.white.opacity(0.8))
-                    }
-                }
-                .clipShape(RoundedRectangle(cornerRadius: coverCorner, style: .continuous))
-                // Same glass edge the library's covers wear: hairline plus a
-                // gyro-driven specular, so a cover with dark borders separates
-                // from the background instead of bleeding into it.
-                .overlay(GlassRim(cornerRadius: coverCorner))
-        }
-    }
-
-    /// The cover, flat.
+    /// The read-mode artwork is the full-bleed pannable canvas
+    /// (`readModeLayout` → `AlbumArtCanvasView`), not an inset card. The only
+    /// cover left in the header is the edit-mode PhotosPicker variant, so the
+    /// inset square card and its pixel-sort interaction are gone entirely.
     ///
-    /// It used to be a raised part in a debossed "crater" plate — inner
-    /// shadows carving a well, a drop shadow and contact shadow lifting the
-    /// artwork out of it, a rim highlight on the top edge. All of it is gone;
-    /// the artwork is just the artwork. That also hands the header back the
-    /// 44pt the plate's surround was occupying.
-    private var albumCover: some View {
-        coverArtwork
-            // The wash below fades across exactly this rectangle, so it is
-            // measured rather than derived from the header's paddings — those
-            // are three separate constants and a nav bar away from here.
-            .anchorPreference(key: CoverBoundsKey.self, value: .bounds) { $0 }
-            // Faint, and two layers: a soft ambient one for the lift and a
-            // tight contact one right under the edge, which is what actually
-            // reads as "propped up" rather than "floating". Much lighter than
-            // the pair the crater plate used to need — there is no recess to
-            // climb out of any more, so the same weights would look like the
-            // moulding coming back.
-            .shadow(color: .black.opacity(0.34), radius: 20, x: 0, y: 12)
-            .shadow(color: .black.opacity(0.22), radius: 4, x: 0, y: 3)
-    }
-
     /// The cover's slot. Both variants are the same square (`coverBox` sees to
     /// that), so this `ZStack` never changes size — the swap is a pure
     /// cross-fade with no layout movement at all.
     private var coverSlot: some View {
-        ZStack {
-            if isEditing {
-                editableAlbumCover
-            } else {
-                albumCover
-            }
-        }
+        editableAlbumCover
     }
 
     /// Title and artist. Both variants are the same row with the same
@@ -510,99 +461,14 @@ struct AlbumDetailView: View {
                 text: album.artistName ?? "Unknown Artist",
                 font: .uiSubheadline
             )
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Color.appDimmedText)
         }
         .frame(maxWidth: .infinity, alignment: .center)
         // The whole block is one target, both lines: what the fade says is cut
         // could be either of them, and it is one piece of writing either way.
+        // Tapping the title/artist toggles the track listing.
         .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.easeOut(duration: 0.18)) { isTitleExpanded = true }
-        }
-        // Where the card comes up. Published rather than laid out in place
-        // because the card has to be free to overlap the cover above it and the
-        // tracklist below, and a header row is no place to grow from.
-        .anchorPreference(key: TitleBoundsKey.self, value: .bounds) { $0 }
-    }
-
-    /// The full title and artist, on glass, over the line they were cut on.
-    ///
-    /// Not a popover or a sheet: those come with their own placement, their own
-    /// chrome and their own dismissal, and the ask here is smaller than any of
-    /// them — the same words, in the same place, with nothing in the way. So it
-    /// is drawn where the header's own anchor says the text is, and the only
-    /// interaction it has is that the next tap anywhere puts it away.
-    ///
-    /// `ViewThatFits` gives it a shape rather than a width: a title that fits on
-    /// one line gets a pill drawn to it, and only one that doesn't opens out
-    /// into a wrapped card.
-    private var expandedTitleCard: some View {
-        let card = VStack(spacing: 6) {
-            Text(album.name)
-                .font(.uiTitle2.weight(.semibold))
-                .multilineTextAlignment(.center)
-
-            Text(album.artistName ?? "Unknown Artist")
-                .font(.uiSubheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .padding(.horizontal, 22)
-        .padding(.vertical, 16)
-
-        return ViewThatFits(in: .horizontal) {
-            card.fixedSize()
-            card
-        }
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        // Every tap belongs to the layer behind this one — including the taps
-        // that land on the card itself. There is nothing to press here.
-        .allowsHitTesting(false)
-    }
-
-    private func dismissExpandedTitle() {
-        guard isTitleExpanded else { return }
-        withAnimation(.easeOut(duration: 0.14)) { isTitleExpanded = false }
-    }
-
-    /// The card and the sheet of nothing that holds the screen still behind it.
-    @ViewBuilder
-    private func expandedTitleLayer(_ anchor: Anchor<CGRect>?) -> some View {
-        if isTitleExpanded, let anchor {
-            GeometryReader { proxy in
-                let rect = proxy[anchor]
-                ZStack {
-                    // Catches everything: the tap that dismisses, the drag
-                    // that also dismisses, and equally the button press that
-                    // would otherwise carry on underneath while the card sat
-                    // over the page.
-                    Color.clear
-                        .contentShape(Rectangle())
-                        .onTapGesture { dismissExpandedTitle() }
-                        // Reaching to scroll is the other way of saying "done
-                        // reading". Two points of travel rather than a real
-                        // threshold: this gesture owns the touch it dismisses
-                        // on, so the page can't scroll with it either way, and
-                        // the sooner the card is gone the sooner the *next*
-                        // swipe is an ordinary scroll.
-                        .gesture(
-                            DragGesture(minimumDistance: 2)
-                                .onChanged { _ in dismissExpandedTitle() }
-                        )
-
-                    expandedTitleCard
-                        // Centered on the line it replaces. Horizontally on the
-                        // screen rather than on the anchor: the two are within
-                        // a few points of each other — the title's box sits
-                        // between two equal controls — and the screen's centre
-                        // is the one that can't push a wide card off an edge.
-                        .frame(maxWidth: proxy.size.width - 2 * Self.listSideMargin)
-                        .position(x: proxy.size.width / 2, y: rect.midY)
-                }
-            }
-            .ignoresSafeArea()
-            .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .center)))
-        }
+        .onTapGesture { toggleOverlay() }
     }
 
     /// Shuffle, title and artist, play — one control at each end of the line
@@ -724,11 +590,17 @@ struct AlbumDetailView: View {
     /// around the circle is mostly the shaded half. How much less depends on
     /// the album: the page carries the cover's colour, and a saturated one
     /// gives the highlight more to work against than bare white ever did.
+    @ViewBuilder
     var playButton: some View {
+        let isCurrentAlbumPlaying = isThisAlbumPlaying && playerService.isPlaying
         Button {
-            playerService.playAlbum(album)
+            if isThisAlbumPlaying {
+                playerService.togglePlayPause()
+            } else {
+                playerService.playAlbum(album)
+            }
         } label: {
-            Image(systemName: "play.fill")
+            Image(systemName: isCurrentAlbumPlaying ? "pause.fill" : "play.fill")
                 .font(.ui(20, weight: .semibold))
                 .foregroundStyle(.primary)
                 .frame(width: Self.playControlSize, height: Self.playControlSize)
@@ -736,21 +608,7 @@ struct AlbumDetailView: View {
                 .contentShape(Circle())
         }
         .buttonStyle(ImprintButtonStyle())
-    }
-
-    /// The cover's top and bottom edges as fractions of the screen's height —
-    /// the span the colour wash dissolves across. `nil` until the cover has
-    /// been laid out, or once it has scrolled off the top, where a wash keyed
-    /// to something off screen would just be a band floating on its own.
-    private func coverWashSpan(_ anchor: Anchor<CGRect>?, in proxy: GeometryProxy) -> ClosedRange<CGFloat>? {
-        guard Self.usesCoverWash, let anchor else { return nil }
-        let rect = proxy[anchor]
-        let height = proxy.size.height
-        guard height > 0, rect.maxY > 0 else { return nil }
-        let start = max(0, rect.minY / height)
-        let end = min(1, rect.maxY / height)
-        guard end > start else { return nil }
-        return start...end
+        .animation(.easeInOut(duration: 0.18), value: isCurrentAlbumPlaying)
     }
 
     /// Side of the play/shuffle hit targets, and the ring's diameter.
@@ -931,48 +789,6 @@ struct AlbumDetailView: View {
         }
     }
 
-    /// Track list + album duration footer. Extracted from the List body
-    /// for type-checker budget (see `trackRowCell`).
-    var tracksSection: some View {
-        Section {
-            ForEach(Array(filteredDisplayItems.enumerated()), id: \.element.id) { index, item in
-                switch item {
-                case .track(let track):
-                    trackRowCell(for: track)
-                case .discMarker(_, let label):
-                    let discSeconds = discDurationSeconds(forMarkerAt: index)
-                    DiscMarkerRow(
-                        label: label,
-                        duration: discSeconds > 0 ? formatDuration(discSeconds) : nil
-                    )
-                    .listRowInsets(EdgeInsets(top: 3, leading: Self.trackRowLeadingInset, bottom: 3, trailing: Self.trackRowTrailingInset))
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                }
-            }
-
-            if albumDurationSeconds > 0 {
-                HStack {
-                    Spacer()
-                    // Display layer (Phosphor): the album total is a readout.
-                    Text(formattedAlbumDuration)
-                        .font(.readout(11))
-                        .foregroundStyle(Phosphor.dim)
-                        .phosphorGlow(intensity: 0.4)
-                }
-                // Trailing inset = TrackRow's 8pt row inset + the
-                // ~7pt gap between the "…" glyph's right edge and
-                // its 32pt frame's right edge (SF subheadline
-                // `ellipsis` glyph is ≈18pt wide, centered in 32).
-                // This aligns the duration text's right edge with
-                // the visible right edge of each row's ellipsis.
-                .listRowInsets(EdgeInsets(top: 12, leading: Self.trackRowLeadingInset, bottom: 8, trailing: Self.listSideMargin + 15))
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            }
-        }
-    }
-
     /// Contents of the ellipsis menu. Same items, same order as the panel that
     /// preceded it — the system draws the container now, so there's no frame,
     /// padding, divider or dismissal here to draw or manage.
@@ -1077,86 +893,6 @@ struct AlbumDetailView: View {
         } label: {
             MenuIcon.duplicate.label("Duplicate to…", fallback: "plus.square.on.square")
         }
-    }
-
-    /// Track row + its full modifier chain, extracted from the List body.
-    /// Keeping this inline made the body expression exceed the
-    /// type-checker's budget after the CloudDriveService refactor (the
-    /// body was already near the cliff; see also `initialLoad`).
-    @ViewBuilder
-    private func trackRowCell(for track: Track) -> some View {
-        TrackRow(
-            track: track,
-            number: trackNumbers[track.googleFileId] ?? 0,
-            isCurrentTrack: playerService.currentTrack?.googleFileId == track.googleFileId,
-            isPlaying: playerService.currentTrack?.googleFileId == track.googleFileId && playerService.isPlaying,
-            isCached: track.isLocal || cachedTrackIds.contains(track.googleFileId),
-            isLocal: album.isLocal,
-            onToggleCache: {
-                toggleCache(for: track)
-            },
-            onDownload: {
-                exportTrack(track)
-            },
-            onToggleHidden: {
-                track.isHidden.toggle()
-                try? modelContext.save()
-            },
-            onSplit: splitAction(for: track),
-            // Absent for a local album — nothing on the other end to point at.
-            onShareLink: AlbumShareLink(track: track, in: album) == nil ? nil : {
-                offerShareLink(track: track)
-            }
-        )
-        .listRowInsets(EdgeInsets(top: 3, leading: Self.trackRowLeadingInset, bottom: 3, trailing: Self.trackRowTrailingInset))
-        .alignmentGuide(.listRowSeparatorTrailing) { $0[.trailing] - Self.separatorTrailingPull }
-        .listRowBackground(Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if track.isHidden {
-                // Play the hidden track solo — don't add it to the album queue
-                playerService.playTrack(track, inQueue: [track])
-            } else {
-                playerService.playTrack(track, inQueue: playableTracks)
-            }
-        }
-        .swipeActions(edge: .leading) {
-            Button {
-                playerService.addToQueue(track)
-                queuedTrackId = track.googleFileId
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                Task {
-                    try? await Task.sleep(for: .seconds(1.5))
-                    if queuedTrackId == track.googleFileId {
-                        queuedTrackId = nil
-                    }
-                }
-            } label: {
-                Label("Queue", systemImage: "text.line.last.and.arrowtriangle.forward")
-            }
-            // The system draws this label white in BOTH schemes and ignores
-            // any styling we put on it, so the tint has to carry the contrast.
-            // Only bites on the pale end of the palette; darker accents pass
-            // through untouched.
-            .tint(themeService.accentColor.legibleUnderWhiteLabel)
-        }
-        .overlay(alignment: .trailing) {
-            if queuedTrackId == track.googleFileId {
-                Text("Queued")
-                    .font(.uiCaption2.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    // Same deepened fill as the swipe pill that triggers it —
-                    // the confirmation should read as the same object as the
-                    // control. White is always right on it: the fill is capped
-                    // below `legibleForeground`'s flip point by construction.
-                    .background(themeService.accentColor.legibleUnderWhiteLabel, in: Capsule())
-                    .transition(.opacity.combined(with: .scale))
-                    .padding(.trailing, 8)
-            }
-        }
-        .animation(.easeInOut(duration: 0.2), value: queuedTrackId)
     }
 
     /// Split is only offered where the result can be saved back: local
@@ -1316,9 +1052,53 @@ struct AlbumDetailView: View {
         isThisAlbumPlaying && playerService.isShuffleOn
     }
 
-    // `body` is assembled in stages (list → chrome → presentations → body)
-    // so no single expression exceeds the type-checker's budget.
-    private var listLayer: some View {
+    /// Bottom clearance that lifts content above the collapsed mini player —
+    /// the pill. `0` when nothing is playing.
+    private var pillReserve: CGFloat {
+        playerService.currentTrack != nil ? NowPlayingPill.overlayHeight : 0
+    }
+
+
+    private func toggleOverlay() {
+        withAnimation(.easeInOut(duration: 0.22)) { showOverlay.toggle() }
+    }
+
+    private func dismissOverlay() {
+        guard showOverlay else { return }
+        withAnimation(.easeInOut(duration: 0.22)) { showOverlay = false }
+    }
+
+    /// The album's blurb for the overlay header, or `nil` when there is none.
+    private var albumDescriptionForOverlay: String? {
+        guard let blurb = album.albumDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !blurb.isEmpty else { return nil }
+        return blurb
+    }
+
+    /// Read mode shows the full-bleed pannable art, the tap-toggled tracklist
+    /// overlay, and the bottom glass bar; edit mode keeps the List that the
+    /// reorder/delete affordances and `.onMove` need. `body` is assembled in
+    /// stages (content → chrome → presentations → body) so no single
+    /// expression exceeds the type-checker's budget.
+    @ViewBuilder
+    private var contentLayer: some View {
+        Group {
+            if isEditing {
+                editModeList
+            } else {
+                readModeLayout
+            }
+        }
+        .background(Color.appBackground)
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(isEditing)
+    }
+
+    /// Edit mode keeps the List root (for `.onMove` + the edit environment),
+    /// with the header and edit sections re-hosted here now that the
+    /// read-mode List is gone.
+    private var editModeList: some View {
         List {
             if isSyncing && album.tracks.isEmpty {
                 Section {
@@ -1332,11 +1112,7 @@ struct AlbumDetailView: View {
                 }
             } else {
                 headerSection
-                if isEditing {
-                    editTracksSection
-                } else {
-                    tracksSection
-                }
+                editTracksSection
 
                 if let syncError {
                     Section {
@@ -1348,28 +1124,174 @@ struct AlbumDetailView: View {
                 }
             }
         }
-        .backgroundPreferenceValue(CoverBoundsKey.self) { anchor in
-            GeometryReader { proxy in
-                Color.clear
-                    .appBackground(tint: coverTint, fadingOver: coverWashSpan(anchor, in: proxy))
-            }
-            .ignoresSafeArea()
-        }
-        .appBackground(tint: coverTint, fadingOver: nil)
-        .staticTopFade(tint: coverTint)
         .listStyle(.plain)
         .listSectionSpacing(0)
-        // Plain has no default top margin to cancel, so the header's own
-        // top padding is the whole gap and nothing needs pulling upward.
         .contentMargins(.top, 0, for: .scrollContent)
-        .environment(\.editMode, .constant(isEditing ? .active : .inactive))
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        .navigationBarBackButtonHidden(isEditing)
+        .environment(\.editMode, .constant(.active))
+        .safeAreaInset(edge: .bottom) {
+            if playerService.currentTrack != nil {
+                Color.clear.frame(height: pillReserve)
+            }
+        }
+    }
+
+    /// Read mode keeps a fixed rounded album-art surface above the bottom
+    /// transport bar. The artwork object pans inside that anchored surface;
+    /// edit mode keeps the List that reorder/delete affordances and `.onMove`
+    /// need.
+    private var readModeLayout: some View {
+        ZStack {
+            Color.appBackground
+                .ignoresSafeArea()
+
+            GeometryReader { proxy in
+                let artHeight = min(proxy.size.height * 0.68, proxy.size.width * 1.45)
+
+                VStack(spacing: 0) {
+                    AlbumArtCanvasView(
+                        image: albumImage,
+                        isRevealed: showOverlay
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: artHeight)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+
+                    Spacer(minLength: 0)
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            }
+
+            // Safe-area content: the tap-toggled overlay above the bottom bar.
+            GeometryReader { proxy in
+                let width = proxy.size.width
+                let height = proxy.size.height
+                let bottomSafe = proxy.safeAreaInsets.bottom
+
+                VStack(spacing: 0) {
+                    if showOverlay {
+                        tracklistOverlay
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .transition(.opacity)
+                    } else {
+                        Spacer(minLength: 0)
+                    }
+
+                    bottomBar
+                        .padding(.horizontal, Self.barHorizontalInset)
+                        .padding(.top, 8)
+                        .padding(.bottom, bottomSafe + pillReserve)
+                }
+                .frame(width: width, height: height)
+            }
+        }
+    }
+
+    /// Bottom glass bar: title/artist centered between shuffle and play,
+    /// wearing the pill's glass surface with a distinct rim so it reads as a
+    /// separate surface next to the (borderless) pill.
+    private var bottomBar: some View {
+        HStack(spacing: 12) {
+            shuffleButton
+                .frame(width: Self.playControlSize, alignment: .leading)
+            titleBlock
+            // Balance the leading shuffle slot so the title/artist stays
+            // screen-centered. The play button holds the trailing slot for
+            // albums that aren't playing; while this album plays (and the
+            // miniplayer pill owns play/pause) the slot is left empty.
+            if isThisAlbumPlaying {
+                Color.clear
+                    .frame(width: Self.playControlSize, height: Self.playControlSize)
+            } else {
+                playButton
+                    .frame(width: Self.playControlSize, alignment: .trailing)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: Self.barCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: Self.barCornerRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+        }
+        // The bar sits above the pannable artwork; a soft downward shadow makes
+        // it read as casting onto the cover passing beneath it.
+        .shadow(color: .black.opacity(0.22), radius: 16, x: 0, y: 12)
+        .animation(.easeInOut(duration: 0.24), value: pillReserve)
+    }
+
+    /// The tap-toggled translucent tracklist overlay, over the blurred art.
+    private var tracklistOverlay: some View {
+        TracklistOverlayView(
+            title: album.name,
+            artist: album.artistName ?? "Unknown Artist",
+            description: albumDescriptionForOverlay,
+            albumDuration: albumDurationSeconds > 0 ? formattedAlbumDuration : nil,
+            topInset: 0,
+            onDismiss: dismissOverlay,
+            onRefresh: {
+                guard !isEditing else { return }
+                Task { await syncFromDrive() }
+            }
+        ) {
+            ForEach(Array(filteredDisplayItems.enumerated()), id: \.element.id) { index, item in
+                switch item {
+                case .track(let track):
+                    overlayTrackRow(for: track)
+                case .discMarker(_, let label):
+                    let discSeconds = discDurationSeconds(forMarkerAt: index)
+                    DiscMarkerRow(
+                        label: label,
+                        duration: discSeconds > 0 ? formatDuration(discSeconds) : nil
+                    )
+                    .padding(.horizontal, Self.trackRowLeadingInset)
+                }
+            }
+        }
+    }
+
+    /// A track row for the overlay — the shared `TrackRow` with the List-only
+    /// modifiers (row insets, separators, swipe actions) stripped, hosted in
+    /// the overlay's own `ScrollView`.
+    @ViewBuilder
+    private func overlayTrackRow(for track: Track) -> some View {
+        TrackRow(
+            track: track,
+            number: trackNumbers[track.googleFileId] ?? 0,
+            isCurrentTrack: playerService.currentTrack?.googleFileId == track.googleFileId,
+            isPlaying: playerService.currentTrack?.googleFileId == track.googleFileId && playerService.isPlaying,
+            isCached: track.isLocal || cachedTrackIds.contains(track.googleFileId),
+            isLocal: album.isLocal,
+            durationText: trackDurations[track.googleFileId].map { formatDuration($0) },
+            onToggleCache: {
+                toggleCache(for: track)
+            },
+            onDownload: {
+                exportTrack(track)
+            },
+            onToggleHidden: {
+                track.isHidden.toggle()
+                try? modelContext.save()
+            },
+            onSplit: splitAction(for: track),
+            onShareLink: AlbumShareLink(track: track, in: album) == nil ? nil : {
+                offerShareLink(track: track)
+            }
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if track.isHidden {
+                playerService.playTrack(track, inQueue: [track])
+            } else {
+                playerService.playTrack(track, inQueue: playableTracks)
+            }
+        }
+        .padding(.horizontal, Self.trackRowLeadingInset)
     }
 
     private var chromeLayer: some View {
-        listLayer
+        contentLayer
         .toolbar {
             if isEditing {
                 ToolbarItem(placement: .cancellationAction) {
@@ -1458,11 +1380,6 @@ struct AlbumDetailView: View {
         // Edit-mode presentations belong to the screen, not to the header row
         // they used to hang off — see `editModePresentations`.
         editModePresentations(chromeLayer)
-        // Above the page, so the card can sit over the cover and the tracklist
-        // both, and so the layer that holds the screen still covers all of it.
-        .overlayPreferenceValue(TitleBoundsKey.self) { anchor in
-            expandedTitleLayer(anchor)
-        }
         .sheet(isPresented: $showAccessSheet) {
             AccessSheet(album: album)
         }
@@ -1579,19 +1496,6 @@ struct AlbumDetailView: View {
 
     var body: some View {
         presentationLayer
-        .refreshable {
-            // A pull-to-refresh mid-edit would clobber the working copy
-            // with a fresh sync — ignored until the user saves or cancels.
-            if !isEditing {
-                // This closure runs for exactly the length of a real
-                // refresh, which is what the indicator is gated on — a
-                // short pull never enters it, so nothing is drawn.
-                isRefreshing = true
-                defer { isRefreshing = false }
-                await syncFromDrive()
-            }
-        }
-        .additRefreshIndicator(tint: themeService.accentColor, isRefreshing: isRefreshing)
         .onAppear {
             // Everything this page can know without the network, resolved
             // before the first frame is drawn: the cover, the running order,
@@ -1676,11 +1580,6 @@ struct AlbumDetailView: View {
             refreshCoverAccent()
         }
         .onChange(of: colorScheme) { _, _ in refreshCoverTint() }
-        .safeAreaInset(edge: .bottom) {
-            if playerService.currentTrack != nil {
-                Color.clear.frame(height: 64)
-            }
-        }
     }
 
     // MARK: - Cover tint
@@ -2111,15 +2010,6 @@ struct AlbumDetailView: View {
         } catch {
             // Keep existing cover metadata on error
         }
-    }
-}
-
-/// Where the header's title and artist sit, so the card that shows them in full
-/// can come up over that same line.
-private struct TitleBoundsKey: PreferenceKey {
-    static let defaultValue: Anchor<CGRect>? = nil
-    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
-        value = value ?? nextValue()
     }
 }
 
