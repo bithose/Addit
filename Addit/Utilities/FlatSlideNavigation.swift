@@ -176,6 +176,15 @@ final class FlatSlideCoordinator: NSObject, UINavigationControllerDelegate, UIGe
             && nav.transitionCoordinator == nil
             && interactionController == nil
     }
+
+    /// Let the recreated edge-swipe recognize alongside content gestures
+    /// instead of being starved by them. The album-detail artwork pan covers
+    /// the whole screen and begins first; without this the edge recognizer
+    /// fails and the pop never fires. The artwork drag is inert for touches
+    /// starting in the left-edge band, so the two coexist cleanly.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
 }
 
 // MARK: - Forcing animated transitions

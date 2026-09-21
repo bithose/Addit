@@ -14,6 +14,17 @@ extension Color {
             ? UIColor(red: 0x12 / 255, green: 0x12 / 255, blue: 0x12 / 255, alpha: 1) // #121212 (Spotify's base dark)
             : .systemBackground
     })
+
+    /// Text a notch dimmer than system `.secondary`. The app's secondary copy
+    /// (artist line, track details) reads a touch too bright against the
+    /// charcoal, so these labels drop toward `.tertiary` without going all the
+    /// way. Dark: a step down from secondary's ~55% white; light: a step down
+    /// from secondary's grey.
+    static let appDimmedText = Color(uiColor: UIColor { traits in
+        traits.userInterfaceStyle == .dark
+            ? UIColor(white: 1, alpha: 0.44)
+            : UIColor(white: 0, alpha: 0.60)
+    })
 }
 
 extension Color {

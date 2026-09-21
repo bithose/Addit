@@ -46,14 +46,14 @@ extension Font {
     ///   Bold only: the family has **no SemiBold** in any official build
     ///   (Google Fonts ships only the variable), so `uiHeadline`'s `.semibold`
     ///   resolves to the nearest cut rather than a drawn one.
-    /// - `"BDO Grotesk"` — neo-grotesque. Regular/Medium/DemiBold/Bold, so it
-    ///   does have a real semibold-weight cut.
+    /// - `"BDO Grotesk"` — neo-grotesque, Suisse-like; the current default.
+    ///   Regular/Medium/DemiBold/Bold.
     /// - `"Geist"` — Regular/Medium/SemiBold/Bold.
-    /// - `"Inter"` — the current default. Regular/Medium/SemiBold/Bold, the
-    ///   static cuts from the upstream 4.1 release rather than Google Fonts',
-    ///   whose statics are named per optical size (`Inter 18pt`) and would not
-    ///   answer to this family string.
-    static let appFamily: String? = "Inter"
+    /// - `"Inter"` — Regular/Medium/SemiBold/Bold, the static cuts from the
+    ///   upstream 4.1 release rather than Google Fonts', whose statics are
+    ///   named per optical size (`Inter 18pt`) and would not answer to this
+    ///   family string.
+    static let appFamily: String? = "BDO Grotesk"
 
     /// Fixed-size UI font in the app family.
     static func ui(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {

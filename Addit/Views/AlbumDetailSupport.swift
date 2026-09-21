@@ -10,6 +10,10 @@ struct TrackRow: View {
     let isPlaying: Bool
     let isCached: Bool
     var isLocal: Bool = false
+    /// Pre-formatted run time, shown as a trailing readout before the "…"
+    /// menu. `nil` omits it (uncached Drive tracks that haven't been
+    /// measured yet).
+    var durationText: String?
     var onToggleCache: (() -> Void)?
     var onDownload: (() -> Void)?
     var onToggleHidden: (() -> Void)?
@@ -40,7 +44,7 @@ struct TrackRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(track.displayName)
                     .font(.uiBody.weight(.medium))
-                    .foregroundColor(isCurrentTrack ? themeService.accentColor : track.isHidden ? Color.secondary.opacity(0.5) : .primary)
+                    .foregroundColor(isCurrentTrack ? themeService.accentColor : track.isHidden ? Color.secondary.opacity(0.5) : Color.secondary)
                     .fadingTruncation()
 
                 HStack(spacing: 4) {
@@ -48,17 +52,24 @@ struct TrackRow: View {
                         // Small dot marks a downloaded/on-device track.
                         Circle()
                             .frame(width: 6, height: 6)
-                            .foregroundColor(track.isHidden ? Color.secondary.opacity(0.3) : .secondary)
+                            .foregroundColor(track.isHidden ? Color.secondary.opacity(0.3) : Color.appDimmedText)
                     }
                     if let size = track.fileSize {
                         Text(formatFileSize(size))
                             .font(.uiCaption)
-                            .foregroundColor(track.isHidden ? Color.secondary.opacity(0.3) : .secondary)
+                            .foregroundColor(track.isHidden ? Color.secondary.opacity(0.3) : Color.appDimmedText)
                     }
                 }
             }
 
             Spacer()
+
+            if let durationText {
+                Text(durationText)
+                    .font(.readout(10))
+                    .foregroundStyle(Phosphor.dim)
+                    .phosphorGlow(intensity: 0.4)
+            }
 
             Menu {
                 // File info section
